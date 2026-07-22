@@ -75,6 +75,18 @@ class MainWindow(QMainWindow):
 
         self._status = self.statusBar().showMessage("就绪")
 
+        # Push 模型：启动后台心跳上报线程（若配置了 admin_url）
+        from app.reporter import start_reporter
+
+        start_reporter(self.config)
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        # 窗口关闭时停止上报线程
+        from app.reporter import stop_reporter
+
+        stop_reporter()
+        super().closeEvent(event)
+
     # ---------------- 整合包页 ----------------
 
     def _build_modpack_tab(self) -> QWidget:
@@ -149,6 +161,8 @@ class MainWindow(QMainWindow):
         self._edit_install = QLineEdit(self.config.install_base_dir)
         self._edit_java = QLineEdit(self.config.java_path)
         self._edit_jvm = QLineEdit(" ".join(self.config.jvm_args))
+        self._edit_admin = QLineEdit(self.config.admin_url)
+        self._edit_admin.setPlaceholderText("留空则不上报，例如 http://127.0.0.1:8080")
 
         btn_install = QPushButton("浏览…")
         btn_install.clicked.connect(self._pick_install_dir)
@@ -166,6 +180,7 @@ class MainWindow(QMainWindow):
         form.addRow("安装根目录", row_install)
         form.addRow("Java 路径", row_java)
         form.addRow("JVM 参数", self._edit_jvm)
+        form.addRow("后台地址 (上报)", self._edit_admin)
 
         btn_save = QPushButton("保存设置")
         btn_save.clicked.connect(self._save_settings)
@@ -192,9 +207,23 @@ class MainWindow(QMainWindow):
         self.config.install_base_dir = self._edit_install.text().strip()
         self.config.java_path = self._edit_java.text().strip()
         self.config.jvm_args = self._edit_jvm.text().split()
+        new_admin_url = self._edit_admin.text().strip()
+        admin_changed = new_admin_url != self.config.admin_url
+        self.config.admin_url = new_admin_url
         self.config.save()
         self.manager.update_server(self.config.server_url)
-        self._settings_label.setText("已保存。")
+        # 后台地址变更时重启 reporter
+        if admin_changed:
+            from app.reporter import start_reporter, stop_reporter
+
+            stop_reporter()
+            if self.config.admin_url:
+                start_reporter(self.config)
+                self._settings_label.setText("已保存，已开始向后台上报心跳。")
+            else:
+                self._settings_label.setText("已保存，已停止上报。")
+        else:
+            self._settings_label.setText("已保存。")
         self.statusBar().showMessage("设置已保存", 3000)
 
     # ---------------- 同步 ----------------

@@ -11,6 +11,7 @@ Game Push Manager **Windows 客户端**（PySide6 桌面应用）。从服务端
 - **模组管理**：浏览、下载到对应整合包的 mods 目录
 - **多服务端**：可配置主服务端地址，整合包从该地址下载
 - **可扩展游戏**：通过 `gpm-common` 的 `GameAdapterRegistry` 自动支持新游戏
+- **主动上报心跳**：配置「后台地址」后，启动后台线程定期向 web-admin 上报客户端状态（已安装整合包、上次同步时间等），Push 模型
 
 ## 安装与运行
 
@@ -29,6 +30,9 @@ python run.py
 - 服务端地址（默认 `http://127.0.0.1:8000`）
 - 游戏安装根目录（整合包将解压到 `<根目录>/<game>/<modpack_name>/`）
 - Java 可执行文件路径（启动 MC 需要，留空则用系统 PATH 中的 java）
+- 后台地址（web-admin 地址，配置后客户端会主动向后台上报心跳；留空则不上报）
+
+也可通过环境变量预设：`GPM_ADMIN_URL` / `GPM_REPORTER_INTERVAL` / `GPM_CLIENT_NAME`。
 
 ## 配置存储
 
