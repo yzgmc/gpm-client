@@ -4,11 +4,19 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+# Nuitka 编译后存在该变量；用于区分打包 exe 与源码运行环境
+_IS_COMPILED = "__compiled__" in dir()
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+if _IS_COMPILED:
+    # 打包后：数据目录放在 exe 同级 data/
+    DATA_DIR = Path(sys.executable).resolve().parent / "data"
+else:
+    # 源码运行：仓库根 data/
+    DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 CONFIG_FILE = DATA_DIR / "client_config.json"
 INSTALLED_FILE = DATA_DIR / "installed.json"
 REPORTER_ID_FILE = DATA_DIR / ".reporter_id"

@@ -1,0 +1,62 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout gpm-client
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install git+https://github.com/yzgmc/gpm-common.git
+          pip install "PySide6>=6.6.0" "httpx>=0.27.0"
+          pip install nuitka
+
+      - name: Build with Nuitka
+        shell: pwsh
+        run: |
+          python -m nuitka --onefile --standalone `
+            --windows-console-mode=disable `
+            --output-filename=gpm-client.exe `
+            --output-dir=build `
+            --enable-plugin=pyside6 `
+            --enable-plugin=anti-bloat `
+            --include-package=gpm_common `
+            --include-package=app `
+            --assume-yes-for-downloads `
+            --remove-output `
+            run.py
+
+      - name: Show build output
+        shell: pwsh
+        run: Get-ChildItem -Path build -Recurse | Select-Object FullName, Length
+
+      - name: Upload to Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "latest"
+          gh release create $tag build/gpm-client.exe --target main `
+            --title "GPM 客户端 (最新构建)" `
+            --notes "Nuitka 打包的 Windows 单文件 exe（PySide6 GUI 客户端，无控制台窗口）。
+          配置与已安装游戏数据存放在 exe 同级 data/ 目录。
+          首次运行稍慢（自解压临时文件）。" 2>$null
+          gh release upload $tag build/gpm-client.exe --clobber
