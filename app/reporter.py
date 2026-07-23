@@ -44,14 +44,19 @@ def _build_heartbeat(config: ClientConfig) -> Heartbeat:
 
 
 def start_reporter(config: ClientConfig) -> None:
-    """启动客户端上报线程。若未配置 admin_url 则跳过。"""
+    """启动客户端上报线程。
+
+    admin_url 为空时自动用 server_url 兜底（融合体场景：同步与上报同一地址），
+    这样用户只填一个服务端地址即可同时同步整合包 + 上报心跳到仪表盘。
+    """
     global _reporter
-    if not config.admin_url:
+    admin_url = (config.admin_url or config.server_url or "").strip()
+    if not admin_url:
         return
     if _reporter is not None:
         return
     _reporter = Reporter(
-        admin_url=config.admin_url,
+        admin_url=admin_url,
         build_payload=lambda: _build_heartbeat(config),
         interval=config.reporter_interval,
     )

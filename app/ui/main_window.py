@@ -162,7 +162,7 @@ class MainWindow(QMainWindow):
         self._edit_java = QLineEdit(self.config.java_path)
         self._edit_jvm = QLineEdit(" ".join(self.config.jvm_args))
         self._edit_admin = QLineEdit(self.config.admin_url)
-        self._edit_admin.setPlaceholderText("留空则不上报，例如 http://127.0.0.1:8080")
+        self._edit_admin.setPlaceholderText("留空则用服务端地址上报，或填独立后台地址")
 
         btn_install = QPushButton("浏览…")
         btn_install.clicked.connect(self._pick_install_dir)
@@ -203,25 +203,27 @@ class MainWindow(QMainWindow):
             self._edit_java.setText(f)
 
     def _save_settings(self) -> None:
+        old_server = self.config.server_url
         self.config.server_url = self._edit_server.text().strip()
         self.config.install_base_dir = self._edit_install.text().strip()
         self.config.java_path = self._edit_java.text().strip()
         self.config.jvm_args = self._edit_jvm.text().split()
         new_admin_url = self._edit_admin.text().strip()
         admin_changed = new_admin_url != self.config.admin_url
+        server_changed = self.config.server_url != old_server
         self.config.admin_url = new_admin_url
         self.config.save()
         self.manager.update_server(self.config.server_url)
-        # 后台地址变更时重启 reporter
-        if admin_changed:
+        # 后台地址或服务端地址变更时重启 reporter（admin_url 为空时用 server_url 兜底）
+        if admin_changed or server_changed:
             from app.reporter import start_reporter, stop_reporter
 
             stop_reporter()
+            start_reporter(self.config)
             if self.config.admin_url:
-                start_reporter(self.config)
-                self._settings_label.setText("已保存，已开始向后台上报心跳。")
+                self._settings_label.setText("已保存，已开始向独立后台上报心跳。")
             else:
-                self._settings_label.setText("已保存，已停止上报。")
+                self._settings_label.setText("已保存，已用服务端地址上报心跳。")
         else:
             self._settings_label.setText("已保存。")
         self.statusBar().showMessage("设置已保存", 3000)
