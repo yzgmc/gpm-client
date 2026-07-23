@@ -61,6 +61,8 @@ class DownloadProgressDialog(QDialog):
     def _on_cancel(self) -> None:
         self._canceled = True
         self.canceled.emit()
+        # 立即关闭对话框，不等下载线程退出（下载线程会因 cancel_event 尽快终止）
+        self.reject()
 
     def update_progress(self, downloaded: int, total: int) -> None:
         if total > 0:

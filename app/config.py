@@ -12,11 +12,15 @@ from pathlib import Path
 _IS_COMPILED = "__compiled__" in dir()
 
 if _IS_COMPILED:
-    # 打包后：数据目录放在 exe 同级 data/
+    # 打包后：配置数据放 exe 同级 data/，但安装根目录必须避开 Nuitka onefile
+    # 运行时的临时解压目录（sys.executable 所在的 tmp 目录），否则游戏会被装到临时目录里。
+    # 配置放 exe 同级方便用户找到；安装目录默认用用户主目录下的 GPM/games。
     DATA_DIR = Path(sys.executable).resolve().parent / "data"
+    _DEFAULT_INSTALL_BASE = str(Path.home() / "GPM" / "games")
 else:
     # 源码运行：仓库根 data/
     DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+    _DEFAULT_INSTALL_BASE = str(DATA_DIR / "games")
 CONFIG_FILE = DATA_DIR / "client_config.json"
 INSTALLED_FILE = DATA_DIR / "installed.json"
 REPORTER_ID_FILE = DATA_DIR / ".reporter_id"
@@ -43,7 +47,7 @@ def _load_or_create_reporter_id() -> str:
 @dataclass
 class ClientConfig:
     server_url: str = "http://127.0.0.1:8000"
-    install_base_dir: str = str(DATA_DIR / "games")
+    install_base_dir: str = _DEFAULT_INSTALL_BASE
     java_path: str = ""
     jvm_args: list[str] = field(default_factory=lambda: ["-Xmx4G", "-Xms1G"])
     last_sync_at: str = ""

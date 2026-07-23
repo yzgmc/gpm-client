@@ -356,9 +356,17 @@ class MainWindow(QMainWindow):
             self._post_ui(lambda: self._download_dialog.set_status("完成"))
             self._post_ui(self._download_dialog.accept)
             self._post_ui(lambda: self.statusBar().showMessage(f"{item['name']} 安装完成", 5000))
+        except RuntimeError as e:
+            # 取消或超时：静默关闭对话框，取消不弹错误框
+            if self._cancel_event.is_set() or "取消" in str(e):
+                self._post_ui(lambda: self._download_dialog.reject() if self._download_dialog else None)
+                self._post_ui(lambda: self.statusBar().showMessage("已取消下载", 3000))
+            else:
+                self._post_ui(lambda: show_error(self, "下载失败", f"{type(e).__name__}: {e}"))
+                self._post_ui(lambda: self._download_dialog.reject() if self._download_dialog else None)
         except Exception as e:  # noqa: BLE001
             self._post_ui(lambda: show_error(self, "下载失败", f"{type(e).__name__}: {e}"))
-            self._post_ui(lambda: self._download_dialog.accept() if self._download_dialog else None)
+            self._post_ui(lambda: self._download_dialog.reject() if self._download_dialog else None)
 
     def _on_download_progress(self, downloaded: int, total: int) -> None:
         self._post_ui(lambda: self._download_dialog.update_progress(downloaded, total))
