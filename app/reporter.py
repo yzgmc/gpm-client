@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import platform
 
-from gpm_common import API_VERSION, Heartbeat, Reporter
+from gpm_common import API_VERSION, Heartbeat, Light, LightLevel, Reporter
 
 from app.config import ClientConfig, load_installed
 
@@ -32,6 +32,7 @@ def _build_heartbeat(config: ClientConfig) -> Heartbeat:
         base_url=None,  # 客户端不对外提供服务
         status="online",
         protocol_version=API_VERSION,
+        light=Light(level=LightLevel.GREEN, reason="客户端在线"),  # 在线即绿灯
         metrics={
             "server_url": config.server_url,
             "installed_modpacks": installed_list,
