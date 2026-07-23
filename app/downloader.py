@@ -36,10 +36,14 @@ def download_file(
             resp.raise_for_status()
             total = int(resp.headers.get("content-length", 0) or 0)
             downloaded = 0
+            # 连接建立后立即反馈一次，让 UI 脱离"等待"状态、显示总大小
+            if progress:
+                progress(0, total)
             with open(tmp_path, "wb") as f:
                 # 读取前先检查取消（用户在下载开始前就点取消）
                 if cancel_event is not None and cancel_event.is_set():
                     raise RuntimeError("下载已取消")
+                last_report = 0
                 for chunk in resp.iter_bytes(chunk_size=1 << 16):
                     # 每个 chunk 写入后检查取消，保证点取消能在下个循环立即退出
                     if cancel_event is not None and cancel_event.is_set():
@@ -47,8 +51,10 @@ def download_file(
                     f.write(chunk)
                     hasher.update(chunk)
                     downloaded += len(chunk)
-                    if progress:
+                    # 每 256KB 或完成时回调一次，避免高频投递定时器堆积导致 UI 卡顿
+                    if progress and (downloaded - last_report >= (1 << 18) or downloaded == total):
                         progress(downloaded, total)
+                        last_report = downloaded
     except RuntimeError:
         # 取消：清理临时文件后向上抛
         if os.path.exists(tmp_path):

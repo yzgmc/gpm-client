@@ -70,7 +70,8 @@ class DownloadProgressDialog(QDialog):
             self._bar.setValue(pct)
             self._stat.setText(f"{human_size(downloaded)} / {human_size(total)}")
         else:
-            self._bar.setValue(0)
+            # 服务端未返回 content-length：用不确定模式（滚动条）显示在下载
+            self._bar.setRange(0, 0)  # 0~0 = busy indicator 滚动动画
             self._stat.setText(human_size(downloaded))
 
     def set_status(self, text: str) -> None:
