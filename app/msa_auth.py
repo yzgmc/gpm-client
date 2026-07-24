@@ -28,11 +28,11 @@ import httpx
 
 
 # ============ 配置 ============
-# Prism Launcher 公开 client_id（见其 CMakeLists.txt 的 Launcher_MSA_CLIENT_ID，
-# 已注册 http://localhost loopback 且过 Mojang 审核，mcstore 不会 403）。
-CLIENT_ID = "c36a8f9e-9b5c-4c2d-8a7a-3e5f1b2c4d6e"  # 占位，见下方说明
-# 注意：上面是占位值。实际部署时需填真实 client_id。
-# 若 mcstore 返回 403，说明该 client_id 未过 Mojang 审核，需更换。
+# Prism Launcher 公开 client_id（见 PrismLauncher CMakeLists.txt 的 Launcher_MSA_CLIENT_ID：
+# https://github.com/PrismLauncher/PrismLauncher/blob/develop/CMakeLists.txt#L243）
+# 已注册 http://localhost loopback 且过 Mojang 审核，mcstore 不会 403。
+# 这是公开的非机密值，仅标识应用身份，不涉及账号安全。
+CLIENT_ID = "c36a9fb6-4f2a-41ff-90bd-ae7cc92031eb"
 
 REDIRECT_PORT = 8917  # 本地回调端口（Azure 应用注册 http://localhost 即匹配任意端口）
 REDIRECT_URI = f"http://localhost:{REDIRECT_PORT}/"
@@ -98,12 +98,15 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         q = parse_qs(urlparse(self.path).query)
         code = q.get("code", [None])[0]
         err = q.get("error", [None])[0]
+        err_desc = q.get("error_description", [None])[0]
         self.server.captured_code = code  # type: ignore[attr-defined]
         self.server.captured_err = err  # type: ignore[attr-defined]
+        self.server.captured_err_desc = err_desc  # type: ignore[attr-defined]
         if code:
             body = b"<h1>\xe7\x99\xbb\xe5\xbd\x95\xe6\x88\x90\xe5\x8a\x9f</h1><p>\xe5\x8f\xaf\xe5\x85\xb3\xe9\x97\xad\xe6\xad\xa4\xe9\xa1\xb5\xe9\x9d\xa2\xe8\xbf\x94\xe5\x9b\x9e\xe5\x90\xaf\xe5\x8a\xa8\xe5\x99\xa8\xe3\x80\x82</p>"
         else:
-            body = f"<h1>\xe7\x99\xbb\xe5\xbd\x95\xe5\xa4\xb1\xe8\xb4\xa5</h1><p>{err}</p>".encode("utf-8")
+            desc = err_desc or err or "未知错误"
+            body = f"<h1>\xe7\x99\xbb\xe5\xbd\x95\xe5\xa4\xb1\xe8\xb4\xa5</h1><p>{desc}</p>".encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
@@ -113,11 +116,12 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         pass
 
 
-def _wait_for_code(timeout: float = 300.0) -> tuple[Optional[str], Optional[str]]:
-    """起临时本地 HTTP 服务，阻塞等待浏览器带回 code。返回 (code, error)。"""
+def _wait_for_code(timeout: float = 300.0) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """起临时本地 HTTP 服务，阻塞等待浏览器带回 code。返回 (code, error, error_description)。"""
     server = HTTPServer(("127.0.0.1", REDIRECT_PORT), _CallbackHandler)
     server.captured_code = None  # type: ignore[attr-defined]
     server.captured_err = None  # type: ignore[attr-defined]
+    server.captured_err_desc = None  # type: ignore[attr-defined]
     th = threading.Thread(target=server.serve_forever, daemon=True)
     th.start()
     try:
@@ -126,7 +130,11 @@ def _wait_for_code(timeout: float = 300.0) -> tuple[Optional[str], Optional[str]
             if server.captured_code or server.captured_err:  # type: ignore[attr-defined]
                 break
             time.sleep(0.2)
-        return server.captured_code, server.captured_err  # type: ignore[attr-defined]
+        return (  # type: ignore[attr-defined]
+            server.captured_code,
+            server.captured_err,
+            server.captured_err_desc,
+        )
     finally:
         server.shutdown()
         server.server_close()
@@ -267,9 +275,11 @@ def login_with_browser() -> MsaCredentials:
         # 打不开浏览器时把 URL 返回给调用方展示
         raise RuntimeError(f"无法打开浏览器，请手动访问此 URL 登录：\n{url}")
 
-    code, err = _wait_for_code()
+    code, err, err_desc = _wait_for_code()
     if err or not code:
-        raise RuntimeError(f"未获得授权码（用户可能取消）：error={err}")
+        # error_description 通常含可读的错误说明（如 AADSTS 错误码 + 描述）
+        desc = err_desc or err or "未知错误"
+        raise RuntimeError(f"微软账号授权失败：{desc}")
 
     # 1. MSA token
     ms = _exchange_code_for_ms_token(code)

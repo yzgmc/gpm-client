@@ -654,6 +654,61 @@ class MainWindow(QMainWindow):
                 self._edit_java.setText(java)
         return java
 
+    # ---------------- 原版 MC 文件下载 ----------------
+
+    def _ensure_vanilla_version(self, item: dict) -> bool:
+        """确保原版 MC 版本文件齐全（client jar + libraries + assets）。
+
+        Fabric/Quilt/Forge/NeoForge 安装器只装加载器本身，不下载原版游戏文件。
+        缺少原版 jar 时 Fabric 会报 "Minecraft game provider couldn't locate the game!"。
+
+        返回 True 表示就绪（已存在或下载成功）；False 表示失败或取消。
+        """
+        from app.minecraft_installer import ensure_vanilla_version, is_vanilla_version_ready
+
+        mc_version = item.get("game_version") or ""
+        if not mc_version:
+            return True  # 无版本号，无法处理，交给后续启动逻辑报错
+
+        install_dir = self._modpack_install_dir(item)
+
+        # 快速检查：client jar 已存在则视为就绪，不弹窗
+        if is_vanilla_version_ready(install_dir, mc_version):
+            return True
+
+        stages = [("download", "下载原版文件"), ("done", "完成")]
+        self._loader_cancel.clear()
+        self._loader_dialog = LoaderInstallDialog(
+            f"下载 Minecraft {mc_version}", "原版游戏文件", self, stages=stages
+        )
+        self._loader_dialog.canceled.connect(lambda: self._loader_cancel.set())
+
+        result = {"ok": False}
+
+        def worker() -> None:
+            try:
+                ensure_vanilla_version(
+                    install_dir=install_dir,
+                    mc_version=mc_version,
+                    progress=lambda stage, detail, pct: self._sig_loader_progress.emit(stage, detail, pct),
+                    cancel_event=self._loader_cancel,
+                )
+                result["ok"] = True
+                self._sig_loader_done.emit(f"Minecraft {mc_version} 原版文件就绪")
+            except RuntimeError as e:
+                if self._loader_cancel.is_set() or "取消" in str(e):
+                    self._sig_loader_failed.emit("已取消")
+                else:
+                    self._sig_loader_failed.emit(str(e))
+            except Exception as e:  # noqa: BLE001
+                self._sig_loader_failed.emit(f"{type(e).__name__}: {e}")
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        self._loader_dialog.exec()
+        self._loader_dialog = None
+        return result["ok"]
+
     # ---------------- 加载器自动安装 ----------------
 
     def _modpack_install_dir(self, item: dict) -> str:
@@ -666,8 +721,8 @@ class MainWindow(QMainWindow):
     def _maybe_install_loader(self, item: dict) -> None:
         """整合包下载完成后，按 mod_loader 自动弹出多阶段安装窗口。
 
-        vanilla 不需要安装器，但仍需确保 Java 可用（启动游戏要用）；
-        其余加载器先确保 Java，再调用 loader_installer 统一安装。
+        流程：确保 Java → 下载原版 MC 文件 → 安装加载器（vanilla 跳过加载器）。
+        vanilla 不需要安装器，但仍需确保 Java 和原版文件齐全。
         """
         loader = (item.get("mod_loader") or "vanilla").lower()
         mc_version = item.get("game_version") or ""
@@ -676,6 +731,11 @@ class MainWindow(QMainWindow):
         if mc_version:
             if not self._ensure_java(mc_version):
                 return  # Java 未就绪或被取消，中止后续安装
+
+        # 下载原版 MC 文件（client jar + libraries + assets），所有加载器都需要
+        if mc_version:
+            if not self._ensure_vanilla_version(item):
+                return  # 原版文件未就绪或被取消
 
         if loader == "vanilla":
             return
@@ -835,6 +895,10 @@ class MainWindow(QMainWindow):
         if mc_version:
             if not self._ensure_java(mc_version):
                 return  # Java 未就绪或被取消
+        # 确保原版 MC 文件齐全（兼容旧整合包：下载前未自动拉取原版文件的情况）
+        if mc_version:
+            if not self._ensure_vanilla_version(mp):
+                return  # 原版文件未就绪或被取消
         # 解析正版账号：已登录微软账号则用正版启动，token 过期则静默续登
         account, aborted = self._resolve_launch_account()
         if aborted:
