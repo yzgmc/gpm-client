@@ -100,7 +100,7 @@ class ClientConfig:
     server_url: str = "http://127.0.0.1:8001"
     install_base_dir: str = _DEFAULT_INSTALL_BASE
     java_path: str = ""
-    jvm_args: list[str] = field(default_factory=lambda: ["-Xmx4G", "-Xms1G"])
+    jvm_args: list[str] = field(default_factory=list)  # 空=启动时自动分配内存+优化参数
     last_sync_at: str = ""
     # Push 模型：向 web-admin 上报心跳
     admin_url: str = os.getenv("GPM_ADMIN_URL", "")  # 留空则不上报

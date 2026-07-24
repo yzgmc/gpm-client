@@ -195,6 +195,7 @@ class MainWindow(QMainWindow):
         self._edit_install = QLineEdit(self.config.install_base_dir)
         self._edit_java = QLineEdit(self.config.java_path)
         self._edit_jvm = QLineEdit(" ".join(self.config.jvm_args))
+        self._edit_jvm.setPlaceholderText("留空则启动时自动分配内存并应用 JVM 优化参数")
         self._edit_admin = QLineEdit(self.config.admin_url)
         self._edit_admin.setPlaceholderText("留空则用服务端地址上报，或填独立后台地址")
 
