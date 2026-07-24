@@ -1,30 +1,64 @@
-"""客户端配置：服务端地址、安装目录、Java 路径等。持久化到 data/client_config.json。"""
+"""客户端配置：服务端地址、安装目录、Java 路径等。
+
+持久化策略：
+- 打包成 exe 后：配置文件与下载目录都放 **exe 同级**，重启不丢失。
+- 源码运行：放仓库根 data/。
+
+目录布局（exe 同级）：
+  gpm-client.exe
+  data/                  # 配置与状态
+    client_config.json   # 主配置（服务端地址、登录态等）
+    installed.json       # 已安装条目记录
+    .reporter_id         # 客户端上报 ID
+  downloads/             # 下载的 mod 与整合包安装根目录
+    minecraft/...        # 按游戏分目录安装
+"""
 
 from __future__ import annotations
 
 import json
 import os
 import sys
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-# Nuitka 编译后存在该变量；用于区分打包 exe 与源码运行环境
-# 注意：dir() 在模块顶层不可靠，用 sys 模块检测更稳健
-_IS_COMPILED = "__compiled__" in globals() or hasattr(sys, "_MEIPASS")
 
-if _IS_COMPILED:
-    # 打包后：配置数据放 exe 同级 data/，但安装根目录必须避开 Nuitka onefile
-    # 运行时的临时解压目录（sys.executable 所在的 tmp 目录），否则游戏会被装到临时目录里。
-    # 配置放 exe 同级方便用户找到；安装目录默认用用户主目录下的 GPM/games。
-    DATA_DIR = Path(sys.executable).resolve().parent / "data"
-    _DEFAULT_INSTALL_BASE = str(Path.home() / "GPM" / "games")
-else:
-    # 源码运行：仓库根 data/
-    DATA_DIR = Path(__file__).resolve().parent.parent / "data"
-    _DEFAULT_INSTALL_BASE = str(DATA_DIR / "games")
+def _detect_app_dir() -> Path:
+    """返回应用根目录（配置/数据的存放基准）。
+
+    打包后（exe）：sys.executable 指向 gpm-client.exe，用其所在目录。
+    源码运行：sys.executable 是 python/python3，用本文件所在的仓库根目录。
+
+    不依赖 Nuitka 的 __compiled__ 注入（子模块 globals 里不一定有），
+    也不依赖 PyInstaller 的 sys._MEIPASS（Nuitka 不设置），
+    改用 exe 文件名检测，最稳健。
+    """
+    exe_path = Path(sys.executable).resolve()
+    exe_name = exe_path.name.lower()
+    # 打包后 exe 名以 gpm-client 开头；源码运行时是 python/python3/python.exe
+    if exe_name.startswith("gpm-client"):
+        return exe_path.parent
+    return Path(__file__).resolve().parent.parent
+
+
+# 应用根目录：打包后为 exe 同级，源码运行时为仓库根
+APP_DIR = _detect_app_dir()
+# 配置目录：exe 同级 data/
+DATA_DIR = APP_DIR / "data"
+# 下载与安装根目录：exe 同级 downloads/（存储 mod 和整合包）
+_DOWNLOADS_DIR = APP_DIR / "downloads"
+_DEFAULT_INSTALL_BASE = str(_DOWNLOADS_DIR)
+
 CONFIG_FILE = DATA_DIR / "client_config.json"
 INSTALLED_FILE = DATA_DIR / "installed.json"
 REPORTER_ID_FILE = DATA_DIR / ".reporter_id"
+
+
+def ensure_dirs() -> None:
+    """首次启动时创建配置目录与下载目录（exe 同级）。"""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _load_or_create_reporter_id() -> str:
@@ -34,8 +68,6 @@ def _load_or_create_reporter_id() -> str:
             return REPORTER_ID_FILE.read_text(encoding="utf-8").strip()
         except OSError:
             pass
-    import uuid
-
     rid = f"client-{uuid.uuid4().hex[:8]}"
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -47,7 +79,7 @@ def _load_or_create_reporter_id() -> str:
 
 @dataclass
 class ClientConfig:
-    server_url: str = "http://127.0.0.1:8000"
+    server_url: str = "http://127.0.0.1:8001"
     install_base_dir: str = _DEFAULT_INSTALL_BASE
     java_path: str = ""
     jvm_args: list[str] = field(default_factory=lambda: ["-Xmx4G", "-Xms1G"])
@@ -67,6 +99,8 @@ class ClientConfig:
 
     @classmethod
     def load(cls) -> "ClientConfig":
+        # 首次启动确保目录存在
+        ensure_dirs()
         if CONFIG_FILE.exists():
             try:
                 data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
