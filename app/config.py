@@ -122,12 +122,25 @@ class ClientConfig:
         if CONFIG_FILE.exists():
             try:
                 data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-                # 兼容旧配置文件无新字段的情况
-                fields = cls.__dataclass_fields__
-                kwargs = {k: data.get(k, getattr(cls, k)) for k in fields if k != "reporter_id"}
+                if not isinstance(data, dict):
+                    raise ValueError("配置文件不是有效的 JSON 对象")
+                # 兼容旧配置文件无新字段的情况：用 dataclass 字段定义的默认值兜底。
+                # 注意：field(default_factory=...) 的字段在"类"上没有同名属性，
+                # 不能用 getattr(cls, k)（会抛 AttributeError），必须用 fields() 取默认值。
+                from dataclasses import fields as _dc_fields, MISSING
+                kwargs: dict = {}
+                for f in _dc_fields(cls):
+                    if f.name == "reporter_id":
+                        continue  # reporter_id 由 __post_init__ 处理
+                    if f.name in data:
+                        kwargs[f.name] = data[f.name]
+                    elif f.default is not MISSING:
+                        kwargs[f.name] = f.default
+                    elif f.default_factory is not MISSING:  # type: ignore[misc]
+                        kwargs[f.name] = f.default_factory()  # type: ignore[misc]
                 return cls(**kwargs)
-            except (OSError, json.JSONDecodeError, TypeError):
-                pass
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                pass  # 配置损坏，回退到默认配置
         cfg = cls()
         cfg.save()
         return cfg
