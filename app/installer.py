@@ -36,18 +36,26 @@ def install_modpack(archive_path: str, install_dir: str) -> str:
     return install_dir
 
 
-def install_mod(file_path: str, modpack_meta: dict, install_base_dir: str) -> str:
-    """将单个模组 jar 复制到对应整合包的 mods 目录。返回目标路径。"""
-    game = modpack_meta.get("game", "minecraft")
-    adapter = GameAdapterRegistry.get(game)
-    if adapter:
-        modpack_dir = adapter.install_dir_hint(install_base_dir, modpack_meta)
-    else:
-        modpack_dir = os.path.join(install_base_dir, game, modpack_meta.get("name", "default"))
-    mods_dir = os.path.join(modpack_dir, "mods")
-    os.makedirs(mods_dir, exist_ok=True)
-    dest = os.path.join(mods_dir, os.path.basename(file_path))
+def install_mod(file_path: str, modpack_meta: dict, install_base_dir: str, target_dir: str | None = None) -> str:
+    """将单个模组 jar 复制到目标目录。
+
+    - target_dir 给定时：直接复制到该目录（用户"另存为"选择的文件夹）。
+    - target_dir 为 None：复制到 modpack_meta 对应整合包的 mods/ 目录。
+    返回目标路径。
+    """
     import shutil
 
+    if target_dir:
+        mods_dir = target_dir
+    else:
+        game = modpack_meta.get("game", "minecraft")
+        adapter = GameAdapterRegistry.get(game)
+        if adapter:
+            modpack_dir = adapter.install_dir_hint(install_base_dir, modpack_meta)
+        else:
+            modpack_dir = os.path.join(install_base_dir, game, modpack_meta.get("name", "default"))
+        mods_dir = os.path.join(modpack_dir, "mods")
+    os.makedirs(mods_dir, exist_ok=True)
+    dest = os.path.join(mods_dir, os.path.basename(file_path))
     shutil.copy2(file_path, dest)
     return dest

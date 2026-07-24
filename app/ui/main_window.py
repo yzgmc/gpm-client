@@ -317,18 +317,73 @@ class MainWindow(QMainWindow):
         mod = next((m.model_dump() for m in self.manager.last_sync.mods if m.id == mod_id), None)
         if not mod:
             return
-        self._start_download("mods", mod)
+        # 模组下载：让用户选择安装方式
+        modpack_id = mod.get("modpack_id")
+        if modpack_id:
+            mp = next((m.model_dump() for m in self.manager.last_sync.modpacks if m.id == modpack_id), None)
+        else:
+            mp = None
+        choice = self._choose_mod_install_mode(mod, mp)
+        if choice is None:
+            return  # 用户取消
+        # choice: ("modpack", None) 装到整合包 mods/ ; ("saveas", "D:/path") 另存为指定目录
+        self._start_download("mods", mod, mod_mode=choice)
 
-    def _start_download(self, kind: str, item: dict) -> None:
+    def _choose_mod_install_mode(self, mod: dict, modpack: dict | None) -> tuple[str, str | None] | None:
+        """弹出对话框让用户选择模组安装方式。
+
+        返回:
+          ("modpack", None) - 装到所属整合包的 mods/ 目录
+          ("saveas", path)  - 另存为用户选择的文件夹
+          None              - 用户取消
+        """
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("下载模组 - 选择安装方式")
+        if modpack:
+            msg_box.setText(
+                f"模组：{mod['name']} v{mod['version']}\n"
+                f"所属整合包：{modpack['name']} v{modpack['version']}\n\n"
+                f"请选择安装方式：\n"
+                f"“装到整合包”：复制到整合包的 mods/ 文件夹（需已安装该整合包）\n"
+                f"“另存为”：选择一个文件夹保存模组文件"
+            )
+            install_btn = msg_box.addButton("装到整合包", QMessageBox.AcceptRole)
+        else:
+            msg_box.setText(
+                f"模组：{mod['name']} v{mod['version']}\n\n"
+                f"该模组未关联整合包，请选择保存位置：\n"
+                f"“另存为”：选择一个文件夹保存模组文件\n"
+                f"“取消”：放弃下载"
+            )
+            install_btn = None
+        saveas_btn = msg_box.addButton("另存为", QMessageBox.AcceptRole)
+        cancel_btn = msg_box.addButton("取消", QMessageBox.RejectRole)
+        msg_box.exec()
+        clicked = msg_box.clickedButton()
+
+        if clicked is cancel_btn or clicked is None:
+            return None
+        if clicked is install_btn and modpack:
+            return ("modpack", None)
+        if clicked is saveas_btn:
+            target = QFileDialog.getExistingDirectory(self, "选择模组保存文件夹", self.config.install_base_dir)
+            if not target:
+                return None
+            return ("saveas", target)
+        return None
+
+    def _start_download(self, kind: str, item: dict, mod_mode: tuple[str, str | None] | None = None) -> None:
         self._cancel_event.clear()
         self._download_dialog = DownloadProgressDialog(f"下载 {item['name']}", self)
         self._download_dialog.canceled.connect(lambda: self._cancel_event.set())
 
-        t = threading.Thread(target=self._download_worker, args=(kind, item), daemon=True)
+        t = threading.Thread(target=self._download_worker, args=(kind, item, mod_mode), daemon=True)
         t.start()
         self._download_dialog.exec()
 
-    def _download_worker(self, kind: str, item: dict) -> None:
+    def _download_worker(self, kind: str, item: dict, mod_mode: tuple[str, str | None] | None = None) -> None:
         try:
             url = self.manager.client.download_url(kind, item["id"])
             local_dir = os.path.join(self.config.install_base_dir, ".cache", kind, item["id"])
@@ -352,14 +407,25 @@ class MainWindow(QMainWindow):
                     install_dir = os.path.join(self.config.install_base_dir, item["game"], item["name"])
                 install_modpack(dest, install_dir)
             else:
-                # 模组：安装到所属整合包目录的 mods/
-                if item.get("modpack_id"):
-                    mp = next(
-                        (m.model_dump() for m in self.manager.last_sync.modpacks if m.id == item["modpack_id"]),
-                        None,
-                    )
+                # 模组：根据用户选择的安装方式处理
+                # mod_mode: ("modpack", None) 装到整合包 mods/ ; ("saveas", path) 另存为指定目录
+                if mod_mode and mod_mode[0] == "saveas":
+                    target_dir = mod_mode[1]
+                    install_mod(dest, {}, self.config.install_base_dir, target_dir=target_dir)
+                elif mod_mode and mod_mode[0] == "modpack":
+                    # 装到所属整合包的 mods/
+                    mp = None
+                    if item.get("modpack_id") and self.manager.last_sync:
+                        mp = next(
+                            (m.model_dump() for m in self.manager.last_sync.modpacks if m.id == item["modpack_id"]),
+                            None,
+                        )
                     if mp:
                         install_mod(dest, mp, self.config.install_base_dir)
+                    else:
+                        self._sig_fail.emit("安装失败", "未找到所属整合包信息，无法定位 mods 目录")
+                        self._sig_close_dialog.emit(1)
+                        return
 
             # 记录本地安装状态
             installed = load_installed()
