@@ -95,29 +95,34 @@ class LoaderInstallDialog(QDialog):
 
     阶段：下载安装器 → 安装加载器 → 完成。
     由工作线程通过 on_progress/on_done/on_failed 驱动（经 Qt 信号投递到主线程后调用）。
+
+    stages 参数允许自定义阶段（供 Java 自动下载复用，如
+    [("download","下载 Java"),("extract","解压 Java"),("done","完成")]），
+    不传则用默认的加载器安装阶段。stage 的 key 与 progress 回调的 stage 一一对应。
     """
 
     canceled = Signal()
 
-    # 阶段展示顺序：key 与 loader_installer 的 progress stage 对应
-    _STAGES = [("download", "下载安装器"), ("install", "安装加载器"), ("done", "完成")]
+    # 默认阶段（加载器安装）：key 与 loader_installer 的 progress stage 对应
+    _DEFAULT_STAGES = [("download", "下载安装器"), ("install", "安装加载器"), ("done", "完成")]
 
-    def __init__(self, title: str, loader_name: str, parent=None) -> None:
+    def __init__(self, title: str, loader_name: str, parent=None, stages=None) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setModal(True)
         self.setMinimumWidth(480)
 
+        self._stages = list(stages) if stages else list(self._DEFAULT_STAGES)
         self._stage_labels: dict[str, QLabel] = {}
         self._stage_bars: dict[str, QProgressBar] = {}
 
         layout = QVBoxLayout(self)
-        title_lbl = QLabel(f"正在为整合包安装 {loader_name} 模组加载器")
+        title_lbl = QLabel(f"正在安装 {loader_name}")
         title_lbl.setStyleSheet("font-size: 14px; font-weight: 600;")
         layout.addWidget(title_lbl)
 
         # 每个阶段一行：状态点 + 阶段名 + 进度条
-        for key, name in self._STAGES:
+        for key, name in self._stages:
             row = QHBoxLayout()
             dot = QLabel("○")
             dot.setStyleSheet("font-size: 16px; color: #8E8E93;")
@@ -169,7 +174,7 @@ class LoaderInstallDialog(QDialog):
     def on_progress(self, stage: str, detail: str, pct: int) -> None:
         # 当前阶段进行中（● 蓝色），已过阶段完成（● 绿色），未到阶段待办（○ 灰）
         reached = False
-        for key, _ in self._STAGES:
+        for key, _ in self._stages:
             dot = self._stage_labels[key]
             if key == stage:
                 dot.setText("●")
@@ -190,7 +195,7 @@ class LoaderInstallDialog(QDialog):
 
     def on_done(self, msg: str) -> None:
         # 全部阶段标记完成
-        for key, _ in self._STAGES:
+        for key, _ in self._stages:
             self._stage_labels[key].setText("●")
             self._stage_labels[key].setStyleSheet("font-size: 16px; color: #30D158;")
             self._stage_bars[key].setValue(100)

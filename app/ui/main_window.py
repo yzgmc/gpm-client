@@ -33,6 +33,7 @@ from gpm_common import GameAdapterRegistry
 from app.config import ClientConfig, load_installed, save_installed
 from app.downloader import download_file
 from app.installer import install_modpack, install_mod
+from app.java_installer import ensure_java as ensure_java_runtime, _is_usable_java
 from app.launcher import launch
 from app.loader_installer import install_loader, SUPPORTED_LOADERS
 from app.sync_manager import SyncManager
@@ -492,6 +493,64 @@ class MainWindow(QMainWindow):
         else:
             self._download_dialog.reject()
 
+    # ---------------- Java 运行时自动安装 ----------------
+
+    def _ensure_java(self, mc_version: str) -> str | None:
+        """确保有可用的 Java 运行时。若需下载则弹多阶段进度对话框。
+
+        返回可用的 java.exe 路径；失败或取消返回 None。
+        成功下载/定位到新 Java 后会写回 config.java_path 并同步设置页输入框。
+        """
+        # 已配置且可用 → 直接返回，不弹窗
+        if self.config.java_path and _is_usable_java(self.config.java_path):
+            return self.config.java_path
+
+        if not mc_version:
+            show_info(self, "提示", "未识别到游戏版本，无法自动下载匹配的 Java，请在设置中手动指定 Java 路径。")
+            return None
+
+        stages = [("download", "下载 Java"), ("extract", "解压 Java"), ("done", "完成")]
+        self._loader_cancel.clear()
+        self._loader_dialog = LoaderInstallDialog(
+            f"安装 Java · MC {mc_version}", "Java 运行时", self, stages=stages
+        )
+        self._loader_dialog.canceled.connect(lambda: self._loader_cancel.set())
+
+        result = {"java": None}
+
+        def worker() -> None:
+            try:
+                java = ensure_java_runtime(
+                    mc_version=mc_version,
+                    install_base_dir=self.config.install_base_dir,
+                    java_path=self.config.java_path or None,
+                    progress=lambda stage, detail, pct: self._sig_loader_progress.emit(stage, detail, pct),
+                    cancel_event=self._loader_cancel,
+                )
+                result["java"] = java
+                self._sig_loader_done.emit(f"Java 已就绪：{java}")
+            except RuntimeError as e:
+                if self._loader_cancel.is_set() or "取消" in str(e):
+                    self._sig_loader_failed.emit("已取消")
+                else:
+                    self._sig_loader_failed.emit(str(e))
+            except Exception as e:  # noqa: BLE001
+                self._sig_loader_failed.emit(f"{type(e).__name__}: {e}")
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        self._loader_dialog.exec()
+        self._loader_dialog = None
+
+        java = result["java"]
+        if java and java != self.config.java_path:
+            self.config.java_path = java
+            self.config.save()
+            # 同步设置页输入框
+            if hasattr(self, "_edit_java"):
+                self._edit_java.setText(java)
+        return java
+
     # ---------------- 加载器自动安装 ----------------
 
     def _modpack_install_dir(self, item: dict) -> str:
@@ -504,9 +563,17 @@ class MainWindow(QMainWindow):
     def _maybe_install_loader(self, item: dict) -> None:
         """整合包下载完成后，按 mod_loader 自动弹出多阶段安装窗口。
 
-        vanilla 不需要安装器，直接跳过；其余加载器调用 loader_installer 统一安装。
+        vanilla 不需要安装器，但仍需确保 Java 可用（启动游戏要用）；
+        其余加载器先确保 Java，再调用 loader_installer 统一安装。
         """
         loader = (item.get("mod_loader") or "vanilla").lower()
+        mc_version = item.get("game_version") or ""
+
+        # 所有加载器（含 vanilla）启动游戏都需要 Java，先确保 Java 可用
+        if mc_version:
+            if not self._ensure_java(mc_version):
+                return  # Java 未就绪或被取消，中止后续安装
+
         if loader == "vanilla":
             return
         if loader not in SUPPORTED_LOADERS:
@@ -516,7 +583,6 @@ class MainWindow(QMainWindow):
                 f"该整合包使用的加载器 “{loader}” 暂不支持自动安装，请手动安装后启动。",
             )
             return
-        mc_version = item.get("game_version") or ""
         if not mc_version:
             show_info(self, "提示", "该整合包未识别到游戏版本，无法自动安装加载器，请手动安装。")
             return
@@ -584,6 +650,11 @@ class MainWindow(QMainWindow):
         if mp["id"] not in installed:
             show_info(self, "提示", "该整合包尚未下载，请先下载")
             return
+        # 启动前确保 Java 可用（按 MC 版本匹配，缺失则自动下载）
+        mc_version = mp.get("game_version") or ""
+        if mc_version:
+            if not self._ensure_java(mc_version):
+                return  # Java 未就绪或被取消
         try:
             adapter = GameAdapterRegistry.require(mp["game"])
             install_dir = adapter.install_dir_hint(self.config.install_base_dir, mp)

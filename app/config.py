@@ -27,18 +27,26 @@ from pathlib import Path
 def _detect_app_dir() -> Path:
     """返回应用根目录（配置/数据的存放基准）。
 
-    打包后（exe）：sys.executable 指向 gpm-client.exe，用其所在目录。
-    源码运行：sys.executable 是 python/python3，用本文件所在的仓库根目录。
+    打包后（exe）：配置与数据必须放 **exe 同级**，重启不丢失。
+    源码运行：放仓库根 data/。
+
+    关键：Nuitka --onefile 模式下，sys.executable 指向的是**解压到临时目录的 exe 副本**，
+    真正用户双击的 exe 路径存在环境变量 NUITKA_ONEFILE_BINARY 中。必须优先读它，
+    否则配置会写到临时目录，重启即丢。
 
     不依赖 Nuitka 的 __compiled__ 注入（子模块 globals 里不一定有），
-    也不依赖 PyInstaller 的 sys._MEIPASS（Nuitka 不设置），
-    改用 exe 文件名检测，最稳健。
+    也不依赖 PyInstaller 的 sys._MEIPASS（Nuitka 不设置）。
     """
+    # 1. Nuitka onefile：真正的用户 exe 路径
+    onefile = os.environ.get("NUITKA_ONEFILE_BINARY")
+    if onefile:
+        return Path(onefile).resolve().parent
+    # 2. 非 onefile 打包（standalone）：exe 名以 gpm-client 开头
     exe_path = Path(sys.executable).resolve()
     exe_name = exe_path.name.lower()
-    # 打包后 exe 名以 gpm-client 开头；源码运行时是 python/python3/python.exe
     if exe_name.startswith("gpm-client"):
         return exe_path.parent
+    # 3. 源码运行
     return Path(__file__).resolve().parent.parent
 
 
