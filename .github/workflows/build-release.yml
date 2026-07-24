@@ -48,15 +48,30 @@ jobs:
         shell: pwsh
         run: Get-ChildItem -Path build -Recurse | Select-Object FullName, Length
 
-      - name: Upload to Release
+      - name: Generate version tag
+        id: tag
+        shell: pwsh
+        run: |
+          # 每次构建独立 tag：v + UTC 时间戳 + 短 SHA，体现每次改动的过程
+          $ts = (Get-Date).ToUniversalTime().ToString("yyyyMMdd-HHmmss")
+          $sha = "${{ github.sha }}".Substring(0,7)
+          "tag=v$ts-$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "title=v$ts ($sha)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload to Release（每次构建独立 Release）
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $tag = "latest"
-          gh release create $tag build/gpm-client.exe --target main `
-            --title "GPM 客户端 (最新构建)" `
+          $tag = "${{ steps.tag.outputs.tag }}"
+          $title = "${{ steps.tag.outputs.title }}"
+          $commitMsg = git log -1 --pretty=format:"%s"
+          gh release create $tag build/gpm-client.exe --target ${{ github.sha }} `
+            --title "GPM 客户端 $title" `
             --notes "Nuitka 打包的 Windows 单文件 exe（PySide6 GUI 客户端，无控制台窗口）。
+
+          对应提交：${{ github.sha }}
+          提交说明：$commitMsg
+
           配置与已安装游戏数据存放在 exe 同级 data/ 目录。
-          首次运行稍慢（自解压临时文件）。" 2>$null
-          gh release upload $tag build/gpm-client.exe --clobber
+          首次运行稍慢（自解压临时文件）。"
