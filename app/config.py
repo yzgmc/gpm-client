@@ -30,23 +30,33 @@ def _detect_app_dir() -> Path:
     打包后（exe）：配置与数据必须放 **exe 同级**，重启不丢失。
     源码运行：放仓库根 data/。
 
-    关键：Nuitka --onefile 模式下，sys.executable 指向的是**解压到临时目录的 exe 副本**，
-    真正用户双击的 exe 路径存在环境变量 NUITKA_ONEFILE_BINARY 中。必须优先读它，
-    否则配置会写到临时目录，重启即丢。
+    关键：Nuitka --onefile 模式下，sys.executable 指向**解压到临时目录的 exe 副本**，
+    sys.__file__ / __file__ 也指向临时目录里的 .py。若用它们当基准，配置会写到
+    临时目录，重启即丢。
 
-    不依赖 Nuitka 的 __compiled__ 注入（子模块 globals 里不一定有），
-    也不依赖 PyInstaller 的 sys._MEIPASS（Nuitka 不设置）。
+    正确做法（Nuitka 官方文档 + 作者 kayhayen 多个 issue 亲自确认）：
+    **sys.argv[0] 在 onefile 下就是用户双击的原始 exe 路径**，且 Nuitka 保证它是
+    绝对路径。这是唯一官方推荐方式。
+
+    注意：网传的 NUITKA_ONEFILE_BINARY 环境变量**根本不存在**（Nuitka 源码
+    OnefileBootstrap.c 里无此符号），不能用。
     """
-    # 1. Nuitka onefile：真正的用户 exe 路径
-    onefile = os.environ.get("NUITKA_ONEFILE_BINARY")
-    if onefile:
-        return Path(onefile).resolve().parent
-    # 2. 非 onefile 打包（standalone）：exe 名以 gpm-client 开头
-    exe_path = Path(sys.executable).resolve()
-    exe_name = exe_path.name.lower()
-    if exe_name.startswith("gpm-client"):
-        return exe_path.parent
-    # 3. 源码运行
+    # 1. Nuitka 打包态（onefile / standalone）：sys.argv[0] = 用户双击的真实 exe
+    if "__compiled__" in dir():
+        argv0 = sys.argv[0] if sys.argv else ""
+        if argv0:
+            p = Path(argv0)
+            if not p.is_absolute():
+                p = Path.cwd() / p
+            return p.resolve().parent
+    # 2. 源码运行：sys.argv[0] 是 run.py，其父目录即仓库根
+    argv0 = sys.argv[0] if sys.argv else ""
+    if argv0:
+        p = Path(argv0)
+        if not p.is_absolute():
+            p = Path.cwd() / p
+        return p.resolve().parent
+    # 3. 兜底
     return Path(__file__).resolve().parent.parent
 
 
