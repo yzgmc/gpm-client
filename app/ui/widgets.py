@@ -88,3 +88,130 @@ def show_error(parent, title: str, text: str) -> None:
 
 def ask_yes(parent, title: str, text: str) -> bool:
     return QMessageBox.question(parent, title, text, QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes
+
+
+class LoaderInstallDialog(QDialog):
+    """模组加载器安装多阶段进度对话框。
+
+    阶段：下载安装器 → 安装加载器 → 完成。
+    由工作线程通过 on_progress/on_done/on_failed 驱动（经 Qt 信号投递到主线程后调用）。
+    """
+
+    canceled = Signal()
+
+    # 阶段展示顺序：key 与 loader_installer 的 progress stage 对应
+    _STAGES = [("download", "下载安装器"), ("install", "安装加载器"), ("done", "完成")]
+
+    def __init__(self, title: str, loader_name: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setMinimumWidth(480)
+
+        self._stage_labels: dict[str, QLabel] = {}
+        self._stage_bars: dict[str, QProgressBar] = {}
+
+        layout = QVBoxLayout(self)
+        title_lbl = QLabel(f"正在为整合包安装 {loader_name} 模组加载器")
+        title_lbl.setStyleSheet("font-size: 14px; font-weight: 600;")
+        layout.addWidget(title_lbl)
+
+        # 每个阶段一行：状态点 + 阶段名 + 进度条
+        for key, name in self._STAGES:
+            row = QHBoxLayout()
+            dot = QLabel("○")
+            dot.setStyleSheet("font-size: 16px; color: #8E8E93;")
+            dot.setFixedWidth(20)
+            lbl = QLabel(name)
+            row.addWidget(dot)
+            row.addWidget(lbl, 1)
+            layout.addLayout(row)
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setValue(0)
+            bar.setFixedHeight(14)
+            layout.addWidget(bar)
+            self._stage_labels[key] = dot
+            self._stage_bars[key] = bar
+
+        self._detail = QLabel("准备中…")
+        self._detail.setWordWrap(True)
+        self._detail.setStyleSheet("color: #8E8E93; font-size: 12px;")
+        layout.addWidget(self._detail)
+
+        self._log = QLabel("")
+        self._log.setWordWrap(True)
+        self._log.setStyleSheet(
+            "font-size: 11px; color: #48484A; background:#12141A; "
+            "padding:8px; border:1px solid #222630; max-height:120px;"
+        )
+        layout.addWidget(self._log)
+
+        self._cancel_btn = QPushButton("取消")
+        self._cancel_btn.clicked.connect(self._on_cancel)
+        self._done_btn = QPushButton("完成")
+        self._done_btn.setEnabled(False)
+        self._done_btn.clicked.connect(self.accept)
+        row = QHBoxLayout()
+        row.addStretch()
+        row.addWidget(self._cancel_btn)
+        row.addWidget(self._done_btn)
+        layout.addLayout(row)
+
+        self._canceled = False
+        self._log_lines: list[str] = []
+
+    def _on_cancel(self) -> None:
+        self._canceled = True
+        self.canceled.emit()
+
+    # ---------- 由工作线程经信号投递到主线程后调用 ----------
+    def on_progress(self, stage: str, detail: str, pct: int) -> None:
+        # 当前阶段进行中（● 蓝色），已过阶段完成（● 绿色），未到阶段待办（○ 灰）
+        reached = False
+        for key, _ in self._STAGES:
+            dot = self._stage_labels[key]
+            if key == stage:
+                dot.setText("●")
+                dot.setStyleSheet("font-size: 16px; color: #0A84FF;")
+                self._stage_bars[key].setValue(pct)
+                reached = True
+            elif not reached:
+                dot.setText("●")
+                dot.setStyleSheet("font-size: 16px; color: #30D158;")
+                self._stage_bars[key].setValue(100)
+            else:
+                dot.setText("○")
+                dot.setStyleSheet("font-size: 16px; color: #48484A;")
+                self._stage_bars[key].setValue(0)
+        self._detail.setText(detail)
+        self._log_lines.append(f"[{stage}] {detail}")
+        self._log.setText("\n".join(self._log_lines[-8:]))
+
+    def on_done(self, msg: str) -> None:
+        # 全部阶段标记完成
+        for key, _ in self._STAGES:
+            self._stage_labels[key].setText("●")
+            self._stage_labels[key].setStyleSheet("font-size: 16px; color: #30D158;")
+            self._stage_bars[key].setValue(100)
+        self._detail.setText(msg)
+        self._log_lines.append(f"[done] {msg}")
+        self._log.setText("\n".join(self._log_lines[-8:]))
+        self._cancel_btn.setEnabled(False)
+        self._done_btn.setEnabled(True)
+        self._done_btn.setDefault(True)
+        self._done_btn.setFocus()
+
+    def on_failed(self, msg: str) -> None:
+        self._detail.setText("安装失败：" + msg)
+        self._detail.setStyleSheet("color: #FF453A; font-size: 12px;")
+        self._log_lines.append(f"[error] {msg}")
+        self._log.setText("\n".join(self._log_lines[-8:]))
+        self._cancel_btn.setText("关闭")
+        self._cancel_btn.setEnabled(True)
+        try:
+            self._cancel_btn.clicked.disconnect()
+        except RuntimeError:
+            pass
+        self._cancel_btn.clicked.connect(self.reject)
+        self._done_btn.setEnabled(False)

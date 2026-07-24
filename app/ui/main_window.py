@@ -34,8 +34,15 @@ from app.config import ClientConfig, load_installed, save_installed
 from app.downloader import download_file
 from app.installer import install_modpack, install_mod
 from app.launcher import launch
+from app.loader_installer import install_loader, SUPPORTED_LOADERS
 from app.sync_manager import SyncManager
-from app.ui.widgets import DownloadProgressDialog, human_size, show_error, show_info
+from app.ui.widgets import (
+    DownloadProgressDialog,
+    LoaderInstallDialog,
+    human_size,
+    show_error,
+    show_info,
+)
 
 
 class SyncThread(QThread):
@@ -65,6 +72,10 @@ class MainWindow(QMainWindow):
     _sig_close_dialog = Signal(int)         # 0=accept, 1=reject
     _sig_statusbar = Signal(str, int)       # (消息, 毫秒)
     _sig_fail = Signal(str, str)            # (标题, 详情)
+    # 加载器安装多阶段进度信号
+    _sig_loader_progress = Signal(str, str, int)  # (stage, detail, pct)
+    _sig_loader_done = Signal(str)                # (msg)
+    _sig_loader_failed = Signal(str)              # (msg)
 
     def __init__(self, config: ClientConfig | None = None) -> None:
         super().__init__()
@@ -75,6 +86,8 @@ class MainWindow(QMainWindow):
         self.manager = SyncManager(self.config)
         self._download_dialog: DownloadProgressDialog | None = None
         self._cancel_event = threading.Event()
+        self._loader_dialog: LoaderInstallDialog | None = None
+        self._loader_cancel = threading.Event()
 
         # 连接跨线程信号 → 主线程槽函数
         self._sig_progress.connect(self._ui_on_progress)
@@ -82,6 +95,10 @@ class MainWindow(QMainWindow):
         self._sig_close_dialog.connect(self._ui_close_dialog)
         self._sig_statusbar.connect(lambda msg, ms: self.statusBar().showMessage(msg, ms))
         self._sig_fail.connect(lambda title, text: show_error(self, title, text))
+        # 加载器安装信号 → 对话框更新
+        self._sig_loader_progress.connect(self._ui_loader_progress)
+        self._sig_loader_done.connect(self._ui_loader_done)
+        self._sig_loader_failed.connect(self._ui_loader_failed)
 
         tabs = QTabWidget()
         tabs.addTab(self._build_modpack_tab(), "整合包")
@@ -382,6 +399,12 @@ class MainWindow(QMainWindow):
         t = threading.Thread(target=self._download_worker, args=(kind, item, mod_mode), daemon=True)
         t.start()
         self._download_dialog.exec()
+        accepted = self._download_dialog.result() == DownloadProgressDialog.Accepted
+        self._download_dialog = None
+
+        # 整合包下载成功后：按 mod_loader 自动弹出加载器安装窗口
+        if kind == "modpacks" and accepted:
+            self._maybe_install_loader(item)
 
     def _download_worker(self, kind: str, item: dict, mod_mode: tuple[str, str | None] | None = None) -> None:
         try:
@@ -468,6 +491,86 @@ class MainWindow(QMainWindow):
             self._download_dialog.accept()
         else:
             self._download_dialog.reject()
+
+    # ---------------- 加载器自动安装 ----------------
+
+    def _modpack_install_dir(self, item: dict) -> str:
+        """计算整合包解压后的安装目录（与 _download_worker 保持一致）。"""
+        adapter = GameAdapterRegistry.get(item["game"])
+        if adapter:
+            return adapter.install_dir_hint(self.config.install_base_dir, item)
+        return os.path.join(self.config.install_base_dir, item["game"], item["name"])
+
+    def _maybe_install_loader(self, item: dict) -> None:
+        """整合包下载完成后，按 mod_loader 自动弹出多阶段安装窗口。
+
+        vanilla 不需要安装器，直接跳过；其余加载器调用 loader_installer 统一安装。
+        """
+        loader = (item.get("mod_loader") or "vanilla").lower()
+        if loader == "vanilla":
+            return
+        if loader not in SUPPORTED_LOADERS:
+            show_info(
+                self,
+                "提示",
+                f"该整合包使用的加载器 “{loader}” 暂不支持自动安装，请手动安装后启动。",
+            )
+            return
+        mc_version = item.get("game_version") or ""
+        if not mc_version:
+            show_info(self, "提示", "该整合包未识别到游戏版本，无法自动安装加载器，请手动安装。")
+            return
+
+        install_dir = self._modpack_install_dir(item)
+        loader_version = item.get("mod_loader_version") or ""
+        loader_name = loader.capitalize()
+        self._loader_cancel.clear()
+        self._loader_dialog = LoaderInstallDialog(f"安装 {loader_name} · {item['name']}", loader_name, self)
+        self._loader_dialog.canceled.connect(lambda: self._loader_cancel.set())
+
+        t = threading.Thread(
+            target=self._loader_worker,
+            args=(loader, install_dir, mc_version, loader_version),
+            daemon=True,
+        )
+        t.start()
+        self._loader_dialog.exec()
+        self._loader_dialog = None
+
+    def _loader_worker(self, loader: str, install_dir: str, mc_version: str, loader_version: str) -> None:
+        try:
+            install_loader(
+                loader=loader,
+                install_dir=install_dir,
+                mc_version=mc_version,
+                loader_version=loader_version or None,
+                install_base_dir=self.config.install_base_dir,
+                java_path=self.config.java_path,
+                progress=lambda stage, detail, pct: self._sig_loader_progress.emit(stage, detail, pct),
+                cancel_event=self._loader_cancel,
+            )
+            self._sig_loader_done.emit(f"{loader.capitalize()} 已安装到 {install_dir}，可启动游戏")
+        except RuntimeError as e:
+            if self._loader_cancel.is_set() or "取消" in str(e):
+                self._sig_loader_failed.emit("已取消")
+            else:
+                self._sig_loader_failed.emit(str(e))
+        except Exception as e:  # noqa: BLE001
+            self._sig_loader_failed.emit(f"{type(e).__name__}: {e}")
+
+    # ---------- 加载器对话框主线程槽 ----------
+    def _ui_loader_progress(self, stage: str, detail: str, pct: int) -> None:
+        if self._loader_dialog:
+            self._loader_dialog.on_progress(stage, detail, pct)
+
+    def _ui_loader_done(self, msg: str) -> None:
+        if self._loader_dialog:
+            self._loader_dialog.on_done(msg)
+            self._sig_statusbar.emit("加载器安装完成", 5000)
+
+    def _ui_loader_failed(self, msg: str) -> None:
+        if self._loader_dialog:
+            self._loader_dialog.on_failed(msg)
 
     # ---------------- 启动 ----------------
 
