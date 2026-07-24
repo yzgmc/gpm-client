@@ -9,7 +9,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 # Nuitka 编译后存在该变量；用于区分打包 exe 与源码运行环境
-_IS_COMPILED = "__compiled__" in dir()
+# 注意：dir() 在模块顶层不可靠，用 sys 模块检测更稳健
+_IS_COMPILED = "__compiled__" in globals() or hasattr(sys, "_MEIPASS")
 
 if _IS_COMPILED:
     # 打包后：配置数据放 exe 同级 data/，但安装根目录必须避开 Nuitka onefile
@@ -56,6 +57,9 @@ class ClientConfig:
     reporter_interval: float = float(os.getenv("GPM_REPORTER_INTERVAL", "10"))
     client_name: str = os.getenv("GPM_CLIENT_NAME", "Windows 客户端")
     reporter_id: str = ""  # 启动时填充
+    # 登录系统：用户名 + token（登录后持久化，下次启动免登录）
+    username: str = ""
+    token: str = ""
 
     def __post_init__(self) -> None:
         if not self.reporter_id:

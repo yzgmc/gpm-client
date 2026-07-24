@@ -66,12 +66,12 @@ class MainWindow(QMainWindow):
     _sig_statusbar = Signal(str, int)       # (消息, 毫秒)
     _sig_fail = Signal(str, str)            # (标题, 详情)
 
-    def __init__(self) -> None:
+    def __init__(self, config: ClientConfig | None = None) -> None:
         super().__init__()
         self.setWindowTitle("Game Push Manager · 客户端")
         self.resize(900, 600)
 
-        self.config = ClientConfig.load()
+        self.config = config or ClientConfig.load()
         self.manager = SyncManager(self.config)
         self._download_dialog: DownloadProgressDialog | None = None
         self._cancel_event = threading.Event()

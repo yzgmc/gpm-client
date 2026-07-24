@@ -29,6 +29,7 @@ def _build_heartbeat(config: ClientConfig) -> Heartbeat:
         reporter_id=config.reporter_id,
         kind="client",
         name=config.client_name,
+        username=config.username or None,  # 登录用户名，服务端据此按用户去重
         base_url=None,  # 客户端不对外提供服务
         status="online",
         protocol_version=API_VERSION,
