@@ -41,6 +41,7 @@ from app.java_installer import ensure_java as ensure_java_runtime, _is_usable_ja
 from app.launcher import launch
 from app.loader_installer import install_loader, SUPPORTED_LOADERS
 from app.sync_manager import SyncManager
+from app.ui.version_dialogs import CreateVersionDialog, EditVersionDialog
 from app.ui.widgets import (
     DownloadProgressDialog,
     LoaderInstallDialog,
@@ -48,6 +49,17 @@ from app.ui.widgets import (
     human_size,
     show_error,
     show_info,
+)
+from app.version_manager import (
+    VersionInstance,
+    create_version as vm_create_version,
+    delete_version as vm_delete_version,
+    fetch_mc_version_ids,
+    game_root as vm_game_root,
+    list_versions as vm_list_versions,
+    resolve_game_dir as vm_resolve_game_dir,
+    touch_last_played as vm_touch_last_played,
+    update_instance_config as vm_update_instance_config,
 )
 
 
@@ -82,6 +94,8 @@ class MainWindow(QMainWindow):
     _sig_loader_progress = Signal(str, str, int)  # (stage, detail, pct)
     _sig_loader_done = Signal(str)                # (msg)
     _sig_loader_failed = Signal(str)              # (msg)
+    # 版本管理：MC 版本清单异步填充信号（后台线程 → 主线程更新对话框下拉）
+    _sig_ver_versions = Signal(list)              # (list[str] 版本 id)
 
     def __init__(self, config: ClientConfig | None = None) -> None:
         super().__init__()
@@ -94,6 +108,7 @@ class MainWindow(QMainWindow):
         self._cancel_event = threading.Event()
         self._loader_dialog: LoaderInstallDialog | None = None
         self._loader_cancel = threading.Event()
+        self._ver_create_dlg: CreateVersionDialog | None = None  # 新建版本对话框（版本清单异步回填用）
 
         # 连接跨线程信号 → 主线程槽函数
         self._sig_progress.connect(self._ui_on_progress)
@@ -105,11 +120,16 @@ class MainWindow(QMainWindow):
         self._sig_loader_progress.connect(self._ui_loader_progress)
         self._sig_loader_done.connect(self._ui_loader_done)
         self._sig_loader_failed.connect(self._ui_loader_failed)
+        # 版本管理：版本清单异步回填
+        self._sig_ver_versions.connect(self._ui_ver_versions)
 
         tabs = QTabWidget()
         tabs.addTab(self._build_modpack_tab(), "整合包")
         tabs.addTab(self._build_mod_tab(), "模组")
+        tabs.addTab(self._build_versions_tab(), "版本管理")
         tabs.addTab(self._build_settings_tab(), "设置")
+        self._tabs = tabs
+        tabs.currentChanged.connect(self._on_tab_changed)
         self.setCentralWidget(tabs)
 
         self._build_menu()
@@ -286,6 +306,347 @@ class MainWindow(QMainWindow):
         self._mod_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         layout.addWidget(self._mod_table)
         return w
+
+    # ---------------- 版本管理页 ----------------
+
+    def _build_versions_tab(self) -> QWidget:
+        """版本管理：列出共享游戏根目录下所有版本，可单独启动/配置/删除。
+
+        每个版本有独立的 gpm_instance.json（显示名、Java、JVM 参数、隔离开关），
+        存档/模组/配置按版本隔离，互不干扰（HMCL 风格）。
+        """
+        w = QWidget()
+        layout = QVBoxLayout(w)
+
+        toolbar = QHBoxLayout()
+        btn_new = QPushButton("新建版本")
+        btn_new.clicked.connect(self._ver_on_create)
+        btn_launch = QPushButton("启动")
+        btn_launch.clicked.connect(self._ver_on_launch)
+        btn_edit = QPushButton("配置")
+        btn_edit.clicked.connect(self._ver_on_edit)
+        btn_open = QPushButton("打开目录")
+        btn_open.clicked.connect(self._ver_on_open_dir)
+        btn_del = QPushButton("删除")
+        btn_del.clicked.connect(self._ver_on_delete)
+        btn_refresh = QPushButton("刷新")
+        btn_refresh.clicked.connect(self._ver_refresh)
+        toolbar.addWidget(btn_new)
+        toolbar.addWidget(btn_launch)
+        toolbar.addWidget(btn_edit)
+        toolbar.addWidget(btn_open)
+        toolbar.addWidget(btn_del)
+        toolbar.addStretch()
+        toolbar.addWidget(btn_refresh)
+        layout.addLayout(toolbar)
+
+        self._ver_list = QListWidget()
+        self._ver_list.doubleClicked.connect(lambda *_: self._ver_on_launch())
+        layout.addWidget(self._ver_list)
+
+        hint = QLabel(
+            "版本管理：在共享目录下集中管理多个 Minecraft 版本，每个版本可独立启动，互不干扰。\n"
+            "各版本共享 libraries/assets（省磁盘），存档/模组/配置默认按版本隔离。"
+        )
+        hint.setStyleSheet("color: #8E8E93; font-size: 11px;")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        # 首次填充
+        self._ver_refresh()
+        return w
+
+    def _on_tab_changed(self, index: int) -> None:
+        """切换到版本管理页时自动刷新列表。"""
+        if self._tabs.tabText(index) == "版本管理":
+            self._ver_refresh()
+
+    def _ver_refresh(self) -> None:
+        """扫描共享游戏根目录，刷新版本列表。"""
+        if not hasattr(self, "_ver_list"):
+            return
+        root = vm_game_root(self.config.install_base_dir)
+        versions = vm_list_versions(root)
+        self._ver_list.clear()
+        if not versions:
+            item = QListWidgetItem("（暂无版本，点击「新建版本」创建）")
+            item.setData(Qt.UserRole, None)
+            self._ver_list.addItem(item)
+            return
+        for inst in versions:
+            status = "就绪" if inst.ready else "未完成"
+            iso = "隔离" if inst.isolated else "共享"
+            last = inst.last_played[:16].replace("T", " ") if inst.last_played else "未启动"
+            label = (
+                f"{inst.effective_display_name}  "
+                f"[{inst.mod_loader}"
+                + (f" {inst.mod_loader_version}" if inst.mod_loader_version else "")
+                + f" / MC {inst.game_version or '未知'}]  "
+                f"· {status} · {iso} · 上次：{last}"
+            )
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, inst)
+            self._ver_list.addItem(item)
+
+    def _ver_current(self) -> VersionInstance | None:
+        if not hasattr(self, "_ver_list"):
+            return None
+        item = self._ver_list.currentItem()
+        if not item:
+            return None
+        data = item.data(Qt.UserRole)
+        return data if isinstance(data, VersionInstance) else None
+
+    def _ver_on_create(self) -> None:
+        """新建版本：弹对话框收集参数 → 后台拉原版文件+装加载器 → 写独立配置。"""
+        dlg = CreateVersionDialog(default_java=self.config.java_path, parent=self)
+        # 后台拉取 MC 版本清单填充下拉
+        self._ver_fill_mc_versions(dlg)
+        accepted = dlg.exec() == QDialog.Accepted
+        self._ver_create_dlg = None  # 清理，避免后续误填已关闭的对话框
+        if not accepted:
+            return
+        vals = dlg.values()
+        mc_version = vals["game_version"]
+        loader = vals["mod_loader"]
+        loader_version = vals["mod_loader_version"]
+        display_name = vals["display_name"]
+        isolated = vals["isolated"]
+        java_path = vals["java_path"] or self.config.java_path
+
+        # 安装加载器需要 Java：若仍缺失则尝试自动下载
+        if loader != "vanilla" and not (java_path and _is_usable_java(java_path)):
+            if not self._ensure_java(mc_version):
+                return
+            java_path = self.config.java_path
+
+        stages = [("download", "下载原版文件"), ("install", "安装加载器"), ("done", "完成")]
+        self._loader_cancel.clear()
+        self._loader_dialog = LoaderInstallDialog(
+            f"新建版本 · MC {mc_version} {loader.capitalize()}", loader.capitalize(), self, stages=stages
+        )
+        self._loader_dialog.canceled.connect(lambda: self._loader_cancel.set())
+
+        result: dict = {"vid": None}
+
+        def worker() -> None:
+            try:
+                vid = vm_create_version(
+                    install_base_dir=self.config.install_base_dir,
+                    game_version=mc_version,
+                    loader=loader,
+                    loader_version=loader_version,
+                    display_name=display_name,
+                    java_path=java_path,
+                    isolated=isolated,
+                    progress=lambda stage, detail, pct: self._sig_loader_progress.emit(stage, detail, pct),
+                    cancel_event=self._loader_cancel,
+                )
+                result["vid"] = vid
+                self._sig_loader_done.emit(f"版本 {vid} 已创建")
+            except RuntimeError as e:
+                if self._loader_cancel.is_set() or "取消" in str(e):
+                    self._sig_loader_failed.emit("已取消")
+                else:
+                    self._sig_loader_failed.emit(str(e))
+            except Exception as e:  # noqa: BLE001
+                self._sig_loader_failed.emit(f"{type(e).__name__}: {e}")
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        self._loader_dialog.exec()
+        self._loader_dialog = None
+        # 完成后刷新列表（无论成功失败，都可能已建出原版目录）
+        self._ver_refresh()
+        if result["vid"]:
+            show_info(self, "创建成功", f"版本已创建：{result['vid']}\n可在列表选中后点击「启动」。")
+
+    def _ver_fill_mc_versions(self, dlg: CreateVersionDialog) -> None:
+        """后台拉取 MC 版本清单，完成后通过信号异步回填对话框下拉。
+
+        不阻塞：对话框立即弹出（下拉显示"正在加载版本列表…"），
+        拉取完成后 _sig_ver_versions 信号在主线程把版本填入（exec 期间也能收到）。
+        """
+        self._ver_create_dlg = dlg
+
+        def worker() -> None:
+            versions = fetch_mc_version_ids(release_only=True)
+            self._sig_ver_versions.emit(versions)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _ui_ver_versions(self, versions: list) -> None:
+        """主线程槽：收到后台版本清单后回填新建版本对话框下拉。"""
+        if self._ver_create_dlg is not None:
+            self._ver_create_dlg.set_mc_versions(list(versions))
+
+    def _ver_on_launch(self) -> None:
+        """启动选中版本：确保 Java + 原版文件 → 解析账号 → 按 version_id 与隔离 game_dir 启动。"""
+        inst = self._ver_current()
+        if inst is None:
+            show_info(self, "提示", "请先选择一个版本")
+            return
+        mc_version = inst.game_version or ""
+        # 1. 确保 Java
+        if mc_version:
+            if not self._ensure_java(mc_version):
+                return
+        java_path = inst.java_path or self.config.java_path
+        # 2. 确保原版文件齐全（在共享根目录）
+        if mc_version and not inst.ready:
+            if not self._ver_ensure_files(inst):
+                return
+        # 3. 解析账号
+        account, aborted = self._resolve_launch_account()
+        if aborted:
+            return
+        # 4. 启动
+        try:
+            root = vm_game_root(self.config.install_base_dir)
+            game_dir = vm_resolve_game_dir(root, inst)
+            modpack_meta = {
+                "game_version": mc_version,
+                "mod_loader": inst.mod_loader,
+                "mod_loader_version": inst.mod_loader_version or "",
+                "version_id": inst.version_id,
+            }
+            proc = launch(
+                game="minecraft",
+                install_dir=root,
+                modpack_meta=modpack_meta,
+                java_path=java_path or None,
+                jvm_args=inst.jvm_args or self.config.jvm_args,
+                account=account,
+                game_dir=game_dir,
+            )
+            vm_touch_last_played(inst.version_dir)
+            mode = "正版" if account else "离线"
+            iso = "隔离" if inst.isolated else "共享"
+            self.statusBar().showMessage(
+                f"已启动 {inst.effective_display_name}（{mode}模式·{iso}，PID {proc.pid}）", 5000
+            )
+            self._ver_refresh()
+        except Exception as e:  # noqa: BLE001
+            show_error(self, "启动失败", f"{type(e).__name__}: {e}")
+
+    def _ver_ensure_files(self, inst: VersionInstance) -> bool:
+        """版本未就绪时下载缺失的原版文件到共享根目录。返回是否就绪。"""
+        from app.minecraft_installer import ensure_vanilla_version, is_vanilla_version_ready
+
+        mc_version = inst.game_version
+        if not mc_version:
+            show_error(self, "无法补全", "该版本未识别到游戏版本，无法自动下载原版文件。")
+            return False
+        root = vm_game_root(self.config.install_base_dir)
+        if is_vanilla_version_ready(root, mc_version):
+            return True
+        stages = [("download", "下载原版文件"), ("done", "完成")]
+        self._loader_cancel.clear()
+        self._loader_dialog = LoaderInstallDialog(
+            f"补全原版文件 · MC {mc_version}", "原版游戏文件", self, stages=stages
+        )
+        self._loader_dialog.canceled.connect(lambda: self._loader_cancel.set())
+        result: dict = {"ok": False}
+
+        def worker() -> None:
+            try:
+                ensure_vanilla_version(
+                    install_dir=root,
+                    mc_version=mc_version,
+                    progress=lambda stage, detail, pct: self._sig_loader_progress.emit(stage, detail, pct),
+                    cancel_event=self._loader_cancel,
+                )
+                result["ok"] = True
+                self._sig_loader_done.emit(f"Minecraft {mc_version} 原版文件就绪")
+            except RuntimeError as e:
+                if self._loader_cancel.is_set() or "取消" in str(e):
+                    self._sig_loader_failed.emit("已取消")
+                else:
+                    self._sig_loader_failed.emit(str(e))
+            except Exception as e:  # noqa: BLE001
+                self._sig_loader_failed.emit(f"{type(e).__name__}: {e}")
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        self._loader_dialog.exec()
+        self._loader_dialog = None
+        return result["ok"]
+
+    def _ver_on_edit(self) -> None:
+        """编辑选中版本的独立配置（显示名/Java/JVM/隔离）。"""
+        inst = self._ver_current()
+        if inst is None:
+            show_info(self, "提示", "请先选择一个版本")
+            return
+        global_jvm = " ".join(self.config.jvm_args)
+        dlg = EditVersionDialog(
+            inst,
+            global_java=self.config.java_path,
+            global_jvm=global_jvm,
+            parent=self,
+        )
+        if dlg.exec() != QDialog.Accepted:
+            return
+        vals = dlg.values()
+        vm_update_instance_config(
+            inst.version_dir,
+            display_name=vals["display_name"],
+            java_path=vals["java_path"],
+            jvm_args=vals["jvm_args"],
+            isolated=vals["isolated"],
+        )
+        self._ver_refresh()
+        show_info(self, "已保存", f"版本配置已更新：{inst.effective_display_name}")
+
+    def _ver_on_delete(self) -> None:
+        """删除选中版本目录（仅删该版本，不影响共享库与其它版本）。"""
+        inst = self._ver_current()
+        if inst is None:
+            show_info(self, "提示", "请先选择一个版本")
+            return
+        if not ask_yes(
+            self, "确认删除",
+            f"确定删除版本「{inst.effective_display_name}」吗？\n\n"
+            f"将删除目录：{inst.version_dir}\n"
+            "（共享的 libraries/assets 与其它版本不受影响）\n"
+            "若该版本是原版且被其它加载器版本依赖，删除后那些版本将无法启动。",
+        ):
+            return
+        try:
+            root = vm_game_root(self.config.install_base_dir)
+            vm_delete_version(root, inst.version_id)
+            self._ver_refresh()
+            show_info(self, "已删除", f"版本已删除：{inst.effective_display_name}")
+        except Exception as e:  # noqa: BLE001
+            show_error(self, "删除失败", f"{type(e).__name__}: {e}")
+
+    def _ver_on_open_dir(self) -> None:
+        """在文件管理器中打开版本目录。"""
+        inst = self._ver_current()
+        if inst is None:
+            show_info(self, "提示", "请先选择一个版本")
+            return
+        path = inst.version_dir
+        if not os.path.isdir(path):
+            show_info(self, "提示", "版本目录不存在")
+            return
+        self._open_in_explorer(path)
+
+    @staticmethod
+    def _open_in_explorer(path: str) -> None:
+        import sys
+
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                import subprocess
+                subprocess.Popen(["open", path])
+            else:
+                import subprocess
+                subprocess.Popen(["xdg-open", path])
+        except Exception:
+            pass
 
     # ---------------- 设置页 ----------------
 

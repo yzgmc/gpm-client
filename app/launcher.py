@@ -179,18 +179,21 @@ def launch(
     jvm_args: Optional[list[str]] = None,
     extra_args: Optional[list[str]] = None,
     account: Optional[dict] = None,
+    game_dir: Optional[str] = None,
 ) -> subprocess.Popen:
     """启动游戏。返回子进程对象。
 
     game: 游戏标识（如 minecraft）
-    install_dir: 整合包安装目录
-    modpack_meta: 整合包元数据（含 mod_loader / game_version 等）
+    install_dir: 整合包安装目录（classpath/libraries/assets 解析基准，共享）
+    modpack_meta: 整合包元数据（含 mod_loader / game_version / version_id 等）
     java_path: 来自客户端配置，None 时适配器自检测
     jvm_args: 用户配置的 JVM 参数（可含 -Xmx/-Xms 和优化 flag）。
               为空或仅含部分时，本函数自动补齐内存分配与优化参数。
     extra_args: 额外启动参数
     account: 正版账号信息 dict（含 username/uuid/access_token），None 则离线模式启动。
              通常由 MsaCredentials.to_dict() 提供，调用前应确保 token 有效。
+    game_dir: 游戏运行目录（saves/mods/config 落点）。None=与 install_dir 共享；
+             设为独立目录时实现版本隔离（HMCL 风格），各版本存档/模组互不干扰。
     """
     # 组装最终 JVM 参数：自动内存分配 + 优化 flag + 用户自定义
     final_jvm_args = build_jvm_args(jvm_args)
@@ -200,6 +203,7 @@ def launch(
         java_path=java_path or None,
         jvm_args=final_jvm_args,
         extra_args=list(extra_args or []),
+        game_dir=game_dir,
     )
     # 透传正版账号信息：三者齐全才视为正版启动
     if account and account.get("username") and account.get("uuid") and account.get("mc_access_token"):
@@ -208,5 +212,8 @@ def launch(
         config.access_token = account["mc_access_token"]
         config.user_type = "msa"
     cmd = adapter.build_launch_command(install_dir, config, modpack_meta)
-    # 在安装目录下启动，便于相对路径定位
-    return subprocess.Popen(cmd, cwd=install_dir)
+    # 工作目录：版本隔离时用 game_dir（saves/mods/config 落点），否则用 install_dir
+    cwd = config.game_dir or install_dir
+    if cwd:
+        os.makedirs(cwd, exist_ok=True)
+    return subprocess.Popen(cmd, cwd=cwd)
