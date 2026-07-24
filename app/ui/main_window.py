@@ -57,6 +57,15 @@ class SyncThread(QThread):
 
 
 class MainWindow(QMainWindow):
+    # 跨线程信号：下载工作线程通过这些信号把更新投递到主线程（AutoConnection
+    # 跨线程时自动用 QueuedConnection，由主线程事件循环处理；QDialog.exec()
+    # 的嵌套事件循环能正确接收 queued 事件，从而实时刷新进度条）。
+    _sig_progress = Signal(int, int)        # (downloaded, total)
+    _sig_status = Signal(str)               # 对话框状态文本
+    _sig_close_dialog = Signal(int)         # 0=accept, 1=reject
+    _sig_statusbar = Signal(str, int)       # (消息, 毫秒)
+    _sig_fail = Signal(str, str)            # (标题, 详情)
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Game Push Manager · 客户端")
@@ -66,6 +75,13 @@ class MainWindow(QMainWindow):
         self.manager = SyncManager(self.config)
         self._download_dialog: DownloadProgressDialog | None = None
         self._cancel_event = threading.Event()
+
+        # 连接跨线程信号 → 主线程槽函数
+        self._sig_progress.connect(self._ui_on_progress)
+        self._sig_status.connect(self._ui_set_status)
+        self._sig_close_dialog.connect(self._ui_close_dialog)
+        self._sig_statusbar.connect(lambda msg, ms: self.statusBar().showMessage(msg, ms))
+        self._sig_fail.connect(lambda title, text: show_error(self, title, text))
 
         tabs = QTabWidget()
         tabs.addTab(self._build_modpack_tab(), "整合包")
@@ -317,18 +333,18 @@ class MainWindow(QMainWindow):
             url = self.manager.client.download_url(kind, item["id"])
             local_dir = os.path.join(self.config.install_base_dir, ".cache", kind, item["id"])
             dest = os.path.join(local_dir, item["file_name"])
-            self._post_ui(lambda: self._download_dialog.set_status("下载中…"))
+            self._sig_status.emit("下载中…")
 
             download_file(
                 url,
                 dest,
                 expected_hash=item["file_hash"],
-                progress=self._on_download_progress,
+                progress=lambda d, t: self._sig_progress.emit(d, t),
                 cancel_event=self._cancel_event,
             )
 
             if kind == "modpacks":
-                self._post_ui(lambda: self._download_dialog.set_status("解压安装中…"))
+                self._sig_status.emit("解压安装中…")
                 adapter = GameAdapterRegistry.get(item["game"])
                 if adapter:
                     install_dir = adapter.install_dir_hint(self.config.install_base_dir, item)
@@ -355,28 +371,37 @@ class MainWindow(QMainWindow):
             }
             save_installed(installed)
 
-            self._post_ui(lambda: self._download_dialog.set_status("完成"))
-            self._post_ui(self._download_dialog.accept)
-            self._post_ui(lambda: self.statusBar().showMessage(f"{item['name']} 安装完成", 5000))
+            self._sig_status.emit("完成")
+            self._sig_close_dialog.emit(0)
+            self._sig_statusbar.emit(f"{item['name']} 安装完成", 5000)
         except RuntimeError as e:
             # 取消或超时：静默关闭对话框，取消不弹错误框
             if self._cancel_event.is_set() or "取消" in str(e):
-                self._post_ui(lambda: self._download_dialog.reject() if self._download_dialog else None)
-                self._post_ui(lambda: self.statusBar().showMessage("已取消下载", 3000))
+                self._sig_close_dialog.emit(1)
+                self._sig_statusbar.emit("已取消下载", 3000)
             else:
-                self._post_ui(lambda: show_error(self, "下载失败", f"{type(e).__name__}: {e}"))
-                self._post_ui(lambda: self._download_dialog.reject() if self._download_dialog else None)
+                self._sig_fail.emit("下载失败", f"{type(e).__name__}: {e}")
+                self._sig_close_dialog.emit(1)
         except Exception as e:  # noqa: BLE001
-            self._post_ui(lambda: show_error(self, "下载失败", f"{type(e).__name__}: {e}"))
-            self._post_ui(lambda: self._download_dialog.reject() if self._download_dialog else None)
+            self._sig_fail.emit("下载失败", f"{type(e).__name__}: {e}")
+            self._sig_close_dialog.emit(1)
 
-    def _on_download_progress(self, downloaded: int, total: int) -> None:
-        self._post_ui(lambda: self._download_dialog.update_progress(downloaded, total))
+    # ---------- 主线程槽函数（由跨线程信号触发）----------
+    def _ui_on_progress(self, downloaded: int, total: int) -> None:
+        if self._download_dialog:
+            self._download_dialog.update_progress(downloaded, total)
 
-    def _post_ui(self, fn) -> None:
-        from PySide6.QtCore import QTimer
+    def _ui_set_status(self, text: str) -> None:
+        if self._download_dialog:
+            self._download_dialog.set_status(text)
 
-        QTimer.singleShot(0, fn)
+    def _ui_close_dialog(self, mode: int) -> None:
+        if not self._download_dialog:
+            return
+        if mode == 0:
+            self._download_dialog.accept()
+        else:
+            self._download_dialog.reject()
 
     # ---------------- 启动 ----------------
 
