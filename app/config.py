@@ -110,6 +110,8 @@ class ClientConfig:
     # 登录系统：用户名 + token（登录后持久化，下次启动免登录）
     username: str = ""
     token: str = ""
+    # 微软正版账号凭据（空表示未用微软账号登录，用离线模式启动）
+    msa_credentials: dict = field(default_factory=dict)  # MsaCredentials.to_dict()
 
     def __post_init__(self) -> None:
         if not self.reporter_id:

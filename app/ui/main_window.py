@@ -6,8 +6,10 @@ import os
 import threading
 
 from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -17,6 +19,8 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
+    QMenuBar,
     QMessageBox,
     QPushButton,
     QSplitter,
@@ -40,6 +44,7 @@ from app.sync_manager import SyncManager
 from app.ui.widgets import (
     DownloadProgressDialog,
     LoaderInstallDialog,
+    ask_yes,
     human_size,
     show_error,
     show_info,
@@ -107,6 +112,8 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._build_settings_tab(), "设置")
         self.setCentralWidget(tabs)
 
+        self._build_menu()
+
         self._status = self.statusBar().showMessage("就绪")
 
         # Push 模型：启动后台心跳上报线程（若配置了 admin_url）
@@ -120,6 +127,101 @@ class MainWindow(QMainWindow):
 
         stop_reporter()
         super().closeEvent(event)
+
+    # ---------------- 菜单栏 ----------------
+
+    def _build_menu(self) -> None:
+        """构建顶部菜单栏。"""
+        mb = self.menuBar()
+        account_menu = mb.addMenu("账号(&A)")
+
+        self._act_msa_login = QAction("微软账号登录…", self)
+        self._act_msa_login.triggered.connect(self._on_msa_login)
+        account_menu.addAction(self._act_msa_login)
+
+        self._act_msa_logout = QAction("退出微软账号", self)
+        self._act_msa_logout.triggered.connect(self._on_msa_logout)
+        self._act_msa_logout.setEnabled(False)
+        account_menu.addAction(self._act_msa_logout)
+
+        account_menu.addSeparator()
+        self._act_msa_status = QAction("当前：离线模式", self)
+        self._act_msa_status.setEnabled(False)
+        account_menu.addAction(self._act_msa_status)
+
+        # 初始刷新菜单状态
+        self._refresh_msa_menu()
+
+    def _refresh_msa_menu(self) -> None:
+        """根据 config.msa_credentials 刷新菜单显示。"""
+        from app.msa_auth import MsaCredentials
+
+        if self.config.msa_credentials:
+            creds = MsaCredentials.from_dict(self.config.msa_credentials)
+            self._act_msa_status.setText(f"当前：{creds.username}（正版）")
+            self._act_msa_login.setText("切换微软账号…")
+            self._act_msa_logout.setEnabled(True)
+        else:
+            self._act_msa_status.setText("当前：离线模式")
+            self._act_msa_login.setText("微软账号登录…")
+            self._act_msa_logout.setEnabled(False)
+
+    def _on_msa_login(self) -> None:
+        """微软账号登录：后台线程跑 OAuth 流程，避免阻塞 UI。"""
+        from app.msa_auth import login_with_browser, MsaCredentials
+
+        # 用进度对话框提示用户正在登录
+        from PySide6.QtWidgets import QProgressDialog
+
+        progress = QProgressDialog("正在登录微软账号，请在弹出的浏览器中完成登录…", "取消", 0, 0, self)
+        progress.setWindowTitle("微软账号登录")
+        progress.setModal(True)
+        progress.setMinimumDuration(0)
+
+        result: dict = {"creds": None, "error": None}
+        done_event = threading.Event()
+
+        def worker() -> None:
+            try:
+                creds = login_with_browser()
+                result["creds"] = creds
+            except Exception as e:  # noqa: BLE001
+                result["error"] = f"{type(e).__name__}: {e}"
+            finally:
+                done_event.set()
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+
+        # 轮询等待完成（让 UI 保持响应）
+        while not done_event.is_set():
+            QApplication.processEvents()
+            if progress.wasCanceled():
+                # 取消只是关闭提示，OAuth 流程已在后台跑，用户可关浏览器放弃
+                break
+            done_event.wait(0.1)
+
+        progress.close()
+
+        if result["creds"]:
+            creds: MsaCredentials = result["creds"]
+            self.config.msa_credentials = creds.to_dict()
+            self.config.save()
+            self._refresh_msa_menu()
+            show_info(self, "登录成功", f"已登录微软账号：{creds.username}\n后续启动游戏将使用正版账号。")
+        elif result["error"]:
+            show_error(self, "微软账号登录失败", str(result["error"]))
+
+    def _on_msa_logout(self) -> None:
+        """退出微软账号，回到离线模式。"""
+        if not self.config.msa_credentials:
+            return
+        if not ask_yes(self, "确认退出", "确定要退出当前微软账号吗？退出后将用离线模式启动游戏。"):
+            return
+        self.config.msa_credentials = {}
+        self.config.save()
+        self._refresh_msa_menu()
+        show_info(self, "已退出", "已退出微软账号，启动游戏将用离线模式。")
 
     # ---------------- 整合包页 ----------------
 
@@ -641,6 +743,83 @@ class MainWindow(QMainWindow):
 
     # ---------------- 启动 ----------------
 
+    def _resolve_launch_account(self) -> tuple[dict | None, bool]:
+        """启动前解析正版账号。
+
+        返回 (account, aborted)：
+        - (None, False)      未登录微软账号 → 离线模式启动
+        - (creds, False)     已登录且凭据有效 → 正版启动
+        - (None, True)       用户取消 → 中止启动
+
+        续登失败时询问用户：重新浏览器登录 / 离线启动 / 取消。
+        account dict 含 username/uuid/mc_access_token，供 launch(account=...) 使用。
+        """
+        from app.msa_auth import MsaCredentials, ensure_valid_credentials
+
+        if not self.config.msa_credentials:
+            return None, False
+
+        creds = MsaCredentials.from_dict(self.config.msa_credentials)
+        if creds.is_mc_token_valid:
+            return creds.to_dict(), False
+
+        # MC token 过期：后台静默续登，避免阻塞 UI
+        from PySide6.QtWidgets import QProgressDialog
+
+        progress = QProgressDialog("正在续登微软账号…", "取消", 0, 0, self)
+        progress.setWindowTitle("微软账号续登")
+        progress.setModal(True)
+        progress.setMinimumDuration(0)
+
+        result: dict = {"creds": None, "error": None}
+        done_event = threading.Event()
+
+        def worker() -> None:
+            try:
+                new_creds = ensure_valid_credentials(creds)
+                result["creds"] = new_creds
+            except Exception as e:  # noqa: BLE001
+                result["error"] = f"{type(e).__name__}: {e}"
+            finally:
+                done_event.set()
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        while not done_event.is_set():
+            QApplication.processEvents()
+            if progress.wasCanceled():
+                break
+            done_event.wait(0.1)
+        progress.close()
+
+        if result["creds"]:
+            new_creds: MsaCredentials = result["creds"]
+            # refresh_token 每次刷新都会轮换，必须持久化最新的
+            self.config.msa_credentials = new_creds.to_dict()
+            self.config.save()
+            self._refresh_msa_menu()
+            return new_creds.to_dict(), False
+
+        # 续登失败：询问用户后续操作
+        if result["error"]:
+            choice = QMessageBox.question(
+                self,
+                "微软账号续登失败",
+                f"续登失败：{result['error']}\n\n是否重新打开浏览器登录？\n"
+                "（“是”=重新登录；“否”=用离线模式启动本次；“取消”=中止启动）",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+            )
+            if choice == QMessageBox.Yes:
+                self._on_msa_login()
+                # 登录成功后用新凭据启动；失败/取消则中止
+                if self.config.msa_credentials:
+                    return self.config.msa_credentials, False
+                return None, True
+            if choice == QMessageBox.No:
+                return None, False  # 离线模式启动
+            return None, True  # 取消 → 中止启动
+        return None, False
+
     def _on_launch(self) -> None:
         item = self._mp_list.currentItem()
         if not item:
@@ -656,6 +835,10 @@ class MainWindow(QMainWindow):
         if mc_version:
             if not self._ensure_java(mc_version):
                 return  # Java 未就绪或被取消
+        # 解析正版账号：已登录微软账号则用正版启动，token 过期则静默续登
+        account, aborted = self._resolve_launch_account()
+        if aborted:
+            return  # 用户取消，中止启动
         try:
             adapter = GameAdapterRegistry.require(mp["game"])
             install_dir = adapter.install_dir_hint(self.config.install_base_dir, mp)
@@ -665,7 +848,9 @@ class MainWindow(QMainWindow):
                 modpack_meta=mp,
                 java_path=self.config.java_path or None,
                 jvm_args=self.config.jvm_args,
+                account=account,
             )
-            self.statusBar().showMessage(f"已启动 {mp['name']} (PID {proc.pid})", 5000)
+            mode = "正版" if account else "离线"
+            self.statusBar().showMessage(f"已启动 {mp['name']}（{mode}模式，PID {proc.pid}）", 5000)
         except Exception as e:  # noqa: BLE001
             show_error(self, "启动失败", f"{type(e).__name__}: {e}")

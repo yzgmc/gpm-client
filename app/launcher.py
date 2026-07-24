@@ -178,6 +178,7 @@ def launch(
     java_path: Optional[str] = None,
     jvm_args: Optional[list[str]] = None,
     extra_args: Optional[list[str]] = None,
+    account: Optional[dict] = None,
 ) -> subprocess.Popen:
     """启动游戏。返回子进程对象。
 
@@ -188,6 +189,8 @@ def launch(
     jvm_args: 用户配置的 JVM 参数（可含 -Xmx/-Xms 和优化 flag）。
               为空或仅含部分时，本函数自动补齐内存分配与优化参数。
     extra_args: 额外启动参数
+    account: 正版账号信息 dict（含 username/uuid/access_token），None 则离线模式启动。
+             通常由 MsaCredentials.to_dict() 提供，调用前应确保 token 有效。
     """
     # 组装最终 JVM 参数：自动内存分配 + 优化 flag + 用户自定义
     final_jvm_args = build_jvm_args(jvm_args)
@@ -198,6 +201,12 @@ def launch(
         jvm_args=final_jvm_args,
         extra_args=list(extra_args or []),
     )
+    # 透传正版账号信息：三者齐全才视为正版启动
+    if account and account.get("username") and account.get("uuid") and account.get("mc_access_token"):
+        config.username = account["username"]
+        config.uuid = account["uuid"]
+        config.access_token = account["mc_access_token"]
+        config.user_type = "msa"
     cmd = adapter.build_launch_command(install_dir, config, modpack_meta)
     # 在安装目录下启动，便于相对路径定位
     return subprocess.Popen(cmd, cwd=install_dir)
