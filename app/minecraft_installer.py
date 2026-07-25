@@ -47,9 +47,49 @@ _MOJANG_DOMAINS = (
     "https://launchermeta.mojang.com",
 )
 
-_TIMEOUT = httpx.Timeout(15.0, read=120.0)
+_TIMEOUT = httpx.Timeout(10.0, read=120.0)
 # 资源/库文件并发下载数（小文件多，适当提高并发）
-_MAX_WORKERS = 16
+_MAX_WORKERS = 32
+# BMCLAPI 偶发失败时的重试次数（减少回退到慢官方源的概率）
+_MIRROR_RETRIES = 1
+
+# 共享 HTTP 客户端：复用 TCP/TLS 连接，对数千个 assets 小文件避免重复握手，大幅提速
+# httpx.Client 线程安全（通过连接池），可在 ThreadPoolExecutor 中共享
+_HTTP_LIMITS = httpx.Limits(
+    max_connections=_MAX_WORKERS * 2,
+    max_keepalive_connections=_MAX_WORKERS,
+    keepalive_expiry=30.0,
+)
+_http_client: httpx.Client | None = None
+_http_lock = threading.Lock()
+
+
+def _get_http_client() -> httpx.Client:
+    """懒加载共享 HTTP 客户端（带连接池）。"""
+    global _http_client
+    if _http_client is None:
+        with _http_lock:
+            if _http_client is None:
+                _http_client = httpx.Client(
+                    timeout=_TIMEOUT,
+                    follow_redirects=True,
+                    limits=_HTTP_LIMITS,
+                    headers={"User-Agent": "gpm-client/1.0"},
+                )
+    return _http_client
+
+
+def close_http_client() -> None:
+    """关闭共享 HTTP 客户端（进程退出时调用）。"""
+    global _http_client
+    if _http_client is not None:
+        with _http_lock:
+            if _http_client is not None:
+                try:
+                    _http_client.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                _http_client = None
 
 
 def _sha1_file(path: str) -> str:
@@ -95,7 +135,9 @@ def _download_one(
 ) -> None:
     """下载单个文件到 dest，SHA1 校验。已存在且校验通过则跳过。
 
-    多源兜底：按 urls 顺序逐个尝试，任一成功即返回；
+    多源兜底：按 urls 顺序逐个尝试，任一成功即返回。
+    首个源（通常是 BMCLAPI 镜像）失败时重试 _MIRROR_RETRIES 次，减少回退到慢官方源。
+    使用共享 httpx.Client 复用 TCP/TLS 连接，对小文件下载提速明显。
     取消则抛 RuntimeError("已取消")；全部失败抛最后一个异常。
     """
     # 已存在且校验通过 → 跳过（幂等）
@@ -108,40 +150,45 @@ def _download_one(
 
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
     tmp = dest + ".part"
+    client = _get_http_client()
     last_err: Exception | None = None
-    for url in urls:
-        if cancel_event is not None and cancel_event.is_set():
-            raise RuntimeError("已取消")
-        try:
-            with httpx.stream("GET", url, timeout=_TIMEOUT, follow_redirects=True) as resp:
-                resp.raise_for_status()
-                with open(tmp, "wb") as f:
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise RuntimeError("已取消")
-                    for chunk in resp.iter_bytes(chunk_size=1 << 16):
+
+    for idx, url in enumerate(urls):
+        # 首个源（镜像）失败重试，后续源（官方兜底）不重试
+        attempts = _MIRROR_RETRIES + 1 if idx == 0 else 1
+        for attempt in range(attempts):
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("已取消")
+            try:
+                with client.stream("GET", url) as resp:
+                    resp.raise_for_status()
+                    with open(tmp, "wb") as f:
                         if cancel_event is not None and cancel_event.is_set():
                             raise RuntimeError("已取消")
-                        f.write(chunk)
-            if expected_sha1:
-                actual = _sha1_file(tmp)
-                if actual.lower() != expected_sha1.lower():
-                    raise ValueError(f"SHA1 校验失败: {os.path.basename(dest)}")
-            os.replace(tmp, dest)
-            return  # 成功
-        except RuntimeError as e:
-            # 取消异常：立即抛出，不再尝试其它源
-            if "取消" in str(e):
-                if os.path.exists(tmp):
-                    try:
-                        os.remove(tmp)
-                    except OSError:
-                        pass
-                raise
-            last_err = e
-            # 其它 RuntimeError：继续尝试下一个源
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-            # 继续尝试下一个源
+                        for chunk in resp.iter_bytes(chunk_size=1 << 16):
+                            if cancel_event is not None and cancel_event.is_set():
+                                raise RuntimeError("已取消")
+                            f.write(chunk)
+                if expected_sha1:
+                    actual = _sha1_file(tmp)
+                    if actual.lower() != expected_sha1.lower():
+                        raise ValueError(f"SHA1 校验失败: {os.path.basename(dest)}")
+                os.replace(tmp, dest)
+                return  # 成功
+            except RuntimeError as e:
+                # 取消异常：立即抛出，不再尝试
+                if "取消" in str(e):
+                    if os.path.exists(tmp):
+                        try:
+                            os.remove(tmp)
+                        except OSError:
+                            pass
+                    raise
+                last_err = e
+                # 其它 RuntimeError：重试或下一个源
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                # 重试或下一个源
     # 全部失败
     if os.path.exists(tmp):
         try:
@@ -154,13 +201,12 @@ def _download_one(
 
 
 def _get_json(url: str, cancel_event: Optional[threading.Event] = None) -> dict:
-    """GET JSON（单 URL）。"""
+    """GET JSON（复用共享 HTTP 客户端）。"""
     if cancel_event is not None and cancel_event.is_set():
         raise RuntimeError("已取消")
-    with httpx.Client(timeout=_TIMEOUT, follow_redirects=True) as c:
-        r = c.get(url)
-        r.raise_for_status()
-        return r.json()
+    r = _get_http_client().get(url)
+    r.raise_for_status()
+    return r.json()
 
 
 def _get_manifest(cancel_event: Optional[threading.Event] = None) -> dict:
