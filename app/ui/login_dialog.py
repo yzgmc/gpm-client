@@ -34,17 +34,20 @@ class LoginDialog(QDialog):
         self._token = ""
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
 
         title = QLabel("登录到 GPM 服务端")
-        title.setStyleSheet("font-size: 16px; font-weight: 600; margin-bottom: 8px;")
+        title.setObjectName("title")
         layout.addWidget(title)
 
         hint = QLabel("使用服务端账号登录，同一账号在后台显示为一个客户端。")
-        hint.setStyleSheet("color: #8E8E93; font-size: 12px; margin-bottom: 12px;")
+        hint.setObjectName("hint")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
         form = QFormLayout()
+        form.setSpacing(10)
         self._edit_server = QLineEdit(default_server)
         self._edit_server.setPlaceholderText("http://服务器IP:8001")
         self._edit_user = QLineEdit()
@@ -58,13 +61,15 @@ class LoginDialog(QDialog):
         layout.addLayout(form)
 
         self._msg = QLabel("")
-        self._msg.setStyleSheet("color: #FF453A; font-size: 12px;")
+        self._msg.setObjectName("error")
         self._msg.setWordWrap(True)
         layout.addWidget(self._msg)
 
         btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
         btn_row.addStretch()
         self._btn_login = QPushButton("登录")
+        self._btn_login.setObjectName("primary")
         self._btn_login.setMinimumHeight(38)
         self._btn_login.clicked.connect(self._on_login)
         btn_row.addWidget(self._btn_login)

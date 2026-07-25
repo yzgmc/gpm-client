@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -123,14 +124,33 @@ class MainWindow(QMainWindow):
         # 版本管理：版本清单异步回填
         self._sig_ver_versions.connect(self._ui_ver_versions)
 
-        tabs = QTabWidget()
-        tabs.addTab(self._build_modpack_tab(), "整合包")
-        tabs.addTab(self._build_mod_tab(), "模组")
-        tabs.addTab(self._build_versions_tab(), "版本管理")
-        tabs.addTab(self._build_settings_tab(), "设置")
-        self._tabs = tabs
-        tabs.currentChanged.connect(self._on_tab_changed)
-        self.setCentralWidget(tabs)
+        # 现代布局：左侧导航栏 + 右侧 QStackedWidget 页面区
+        central = QWidget()
+        root = QHBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # 侧边导航栏
+        self._nav = QListWidget()
+        self._nav.setObjectName("navList")
+        self._nav.setFixedWidth(180)
+        for icon, text in [("📦", "整合包"), ("🧩", "模组"), ("🎮", "版本管理"), ("⚙", "设置")]:
+            it = QListWidgetItem(f"  {icon}  {text}")
+            it.setSizeHint(it.sizeHint().expandedTo(QListWidgetItem().sizeHint()))
+            self._nav.addItem(it)
+        self._nav.setCurrentRow(0)
+        self._nav.currentRowChanged.connect(self._on_nav_changed)
+        root.addWidget(self._nav)
+
+        # 页面堆栈
+        self._stack = QStackedWidget()
+        self._stack.addWidget(self._build_modpack_tab())
+        self._stack.addWidget(self._build_mod_tab())
+        self._stack.addWidget(self._build_versions_tab())
+        self._stack.addWidget(self._build_settings_tab())
+        root.addWidget(self._stack, 1)
+
+        self.setCentralWidget(central)
 
         self._build_menu()
 
@@ -248,29 +268,43 @@ class MainWindow(QMainWindow):
     def _build_modpack_tab(self) -> QWidget:
         w = QWidget()
         layout = QVBoxLayout(w)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        # 页面标题行
+        title = QLabel("整合包")
+        title.setObjectName("title")
+        layout.addWidget(title)
 
         toolbar = QHBoxLayout()
+        toolbar.setSpacing(8)
         btn_sync = QPushButton("同步条目")
         btn_sync.clicked.connect(self._on_sync)
         toolbar.addWidget(btn_sync)
         toolbar.addStretch()
         self._mp_count = QLabel("未同步")
+        self._mp_count.setObjectName("count")
         toolbar.addWidget(self._mp_count)
         layout.addLayout(toolbar)
 
         splitter = QSplitter(Qt.Horizontal)
         self._mp_list = QListWidget()
+        self._mp_list.setAlternatingRowColors(True)
         self._mp_list.currentItemChanged.connect(self._on_mp_select)
         splitter.addWidget(self._mp_list)
 
         detail = QWidget()
         d_layout = QVBoxLayout(detail)
+        d_layout.setContentsMargins(0, 0, 0, 0)
+        d_layout.setSpacing(12)
         self._mp_detail = QTextEdit()
         self._mp_detail.setReadOnly(True)
         d_layout.addWidget(self._mp_detail)
 
         btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
         self._btn_download_mp = QPushButton("下载 / 更新")
+        self._btn_download_mp.setObjectName("primary")
         self._btn_download_mp.clicked.connect(self._on_download_modpack)
         self._btn_launch = QPushButton("启动游戏")
         self._btn_launch.clicked.connect(self._on_launch)
@@ -289,8 +323,15 @@ class MainWindow(QMainWindow):
     def _build_mod_tab(self) -> QWidget:
         w = QWidget()
         layout = QVBoxLayout(w)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        title = QLabel("模组")
+        title.setObjectName("title")
+        layout.addWidget(title)
 
         toolbar = QHBoxLayout()
+        toolbar.setSpacing(8)
         btn_sync = QPushButton("同步条目")
         btn_sync.clicked.connect(self._on_sync)
         toolbar.addWidget(btn_sync)
@@ -298,17 +339,19 @@ class MainWindow(QMainWindow):
         self._btn_select_modpack.clicked.connect(self._on_select_same_modpack)
         toolbar.addWidget(self._btn_select_modpack)
         self._btn_download_selected = QPushButton("下载已选")
+        self._btn_download_selected.setObjectName("primary")
         self._btn_download_selected.clicked.connect(self._on_download_selected_mods)
         toolbar.addWidget(self._btn_download_selected)
         toolbar.addStretch()
         self._mod_count = QLabel("未同步")
+        self._mod_count.setObjectName("count")
         toolbar.addWidget(self._mod_count)
         layout.addLayout(toolbar)
 
         hint = QLabel(
             "提示：先选中一个模组，点击「一键选择同整合包」可勾选同整合包下所有未安装模组（已安装自动跳过，防止重复），再点「下载已选」批量同步。"
         )
-        hint.setStyleSheet("color: #8E8E93; font-size: 11px;")
+        hint.setObjectName("hint")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
@@ -317,6 +360,7 @@ class MainWindow(QMainWindow):
         self._mod_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self._mod_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._mod_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._mod_table.setAlternatingRowColors(True)
         layout.addWidget(self._mod_table)
         return w
 
@@ -330,9 +374,17 @@ class MainWindow(QMainWindow):
         """
         w = QWidget()
         layout = QVBoxLayout(w)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        title = QLabel("版本管理")
+        title.setObjectName("title")
+        layout.addWidget(title)
 
         toolbar = QHBoxLayout()
+        toolbar.setSpacing(8)
         btn_new = QPushButton("新建版本")
+        btn_new.setObjectName("primary")
         btn_new.clicked.connect(self._ver_on_create)
         btn_launch = QPushButton("启动")
         btn_launch.clicked.connect(self._ver_on_launch)
@@ -341,6 +393,7 @@ class MainWindow(QMainWindow):
         btn_open = QPushButton("打开目录")
         btn_open.clicked.connect(self._ver_on_open_dir)
         btn_del = QPushButton("删除")
+        btn_del.setObjectName("danger")
         btn_del.clicked.connect(self._ver_on_delete)
         btn_refresh = QPushButton("刷新")
         btn_refresh.clicked.connect(self._ver_refresh)
@@ -354,6 +407,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(toolbar)
 
         self._ver_list = QListWidget()
+        self._ver_list.setAlternatingRowColors(True)
         self._ver_list.doubleClicked.connect(lambda *_: self._ver_on_launch())
         layout.addWidget(self._ver_list)
 
@@ -361,7 +415,7 @@ class MainWindow(QMainWindow):
             "版本管理：在共享目录下集中管理多个 Minecraft 版本，每个版本可独立启动，互不干扰。\n"
             "各版本共享 libraries/assets（省磁盘），存档/模组/配置默认按版本隔离。"
         )
-        hint.setStyleSheet("color: #8E8E93; font-size: 11px;")
+        hint.setObjectName("hint")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
@@ -369,9 +423,13 @@ class MainWindow(QMainWindow):
         self._ver_refresh()
         return w
 
-    def _on_tab_changed(self, index: int) -> None:
-        """切换到版本管理页时自动刷新列表。"""
-        if self._tabs.tabText(index) == "版本管理":
+    def _on_nav_changed(self, index: int) -> None:
+        """切换侧边导航项 → 切换堆栈页面；切到版本管理页自动刷新列表。"""
+        if not hasattr(self, "_stack"):
+            return
+        self._stack.setCurrentIndex(index)
+        # index 2 = 版本管理（与 __init__ 中 addWidget 顺序一致）
+        if index == 2:
             self._ver_refresh()
 
     def _ver_refresh(self) -> None:
@@ -665,7 +723,17 @@ class MainWindow(QMainWindow):
 
     def _build_settings_tab(self) -> QWidget:
         w = QWidget()
-        form = QFormLayout(w)
+        outer = QVBoxLayout(w)
+        outer.setContentsMargins(16, 16, 16, 16)
+        outer.setSpacing(12)
+
+        title = QLabel("设置")
+        title.setObjectName("title")
+        outer.addWidget(title)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(10)
 
         self._edit_server = QLineEdit(self.config.server_url)
         self._edit_install = QLineEdit(self.config.install_base_dir)
@@ -681,9 +749,11 @@ class MainWindow(QMainWindow):
         btn_java.clicked.connect(self._pick_java)
 
         row_install = QHBoxLayout()
+        row_install.setSpacing(8)
         row_install.addWidget(self._edit_install)
         row_install.addWidget(btn_install)
         row_java = QHBoxLayout()
+        row_java.setSpacing(8)
         row_java.addWidget(self._edit_java)
         row_java.addWidget(btn_java)
 
@@ -694,11 +764,15 @@ class MainWindow(QMainWindow):
         form.addRow("后台地址 (上报)", self._edit_admin)
 
         btn_save = QPushButton("保存设置")
+        btn_save.setObjectName("primary")
         btn_save.clicked.connect(self._save_settings)
         form.addRow(btn_save)
 
         self._settings_label = QLabel("")
+        self._settings_label.setObjectName("hint")
         form.addRow(self._settings_label)
+        outer.addLayout(form)
+        outer.addStretch()
         return w
 
     def _pick_install_dir(self) -> None:

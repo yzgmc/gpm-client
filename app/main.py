@@ -17,11 +17,14 @@ from PySide6.QtWidgets import QApplication
 from app.config import ClientConfig
 from app.ui.login_dialog import LoginDialog
 from app.ui.main_window import MainWindow
+from app.ui.theme import apply_dark_theme
 
 
 def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("Game Push Manager Client")
+    # 应用黑色系高质感主题（全局 QSS + 字体）
+    apply_dark_theme(app)
 
     config = ClientConfig.load()
 

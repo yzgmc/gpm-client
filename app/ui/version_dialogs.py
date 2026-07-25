@@ -71,10 +71,11 @@ class CreateVersionDialog(QDialog):
             "说明：各版本共享 libraries/assets（省磁盘），但存档/模组/配置按版本隔离。\n"
             "vanilla 无需 Java 即可创建；安装模组加载器需要 Java。"
         )
-        hint.setStyleSheet("color: #8E8E93; font-size: 11px;")
+        hint.setObjectName("hint")
         hint.setWordWrap(True)
 
         btn_create = QPushButton("创建")
+        btn_create.setObjectName("primary")
         btn_create.setDefault(True)
         btn_create.clicked.connect(self._on_create)
         btn_cancel = QPushButton("取消")
@@ -164,7 +165,7 @@ class EditVersionDialog(QDialog):
             f"加载器：{inst.mod_loader}"
             + (f" {inst.mod_loader_version}" if inst.mod_loader_version else "")
         )
-        info.setStyleSheet("color: #8E8E93; font-size: 11px;")
+        info.setObjectName("hint")
         form.addRow("", info)
 
         self._java = QLineEdit(inst.java_path)
@@ -192,11 +193,12 @@ class EditVersionDialog(QDialog):
             "勾选后该版本的存档/模组/配置存在 versions/<id>/ 下，与其它版本互不干扰；\n"
             "不勾选则所有版本共用同一存档目录（HMCL 非隔离模式）。"
         )
-        iso_hint.setStyleSheet("color: #8E8E93; font-size: 11px;")
+        iso_hint.setObjectName("hint")
         iso_hint.setWordWrap(True)
         form.addRow("", iso_hint)
 
         btn_save = QPushButton("保存")
+        btn_save.setObjectName("primary")
         btn_save.setDefault(True)
         btn_save.clicked.connect(self.accept)
         btn_cancel = QPushButton("取消")

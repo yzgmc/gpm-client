@@ -40,18 +40,24 @@ class DownloadProgressDialog(QDialog):
         self.setMinimumWidth(420)
 
         self._label = QLabel("准备下载…")
+        self._label.setObjectName("subtitle")
         self._bar = QProgressBar()
         self._bar.setRange(0, 100)
+        self._bar.setFixedHeight(18)
         self._stat = QLabel("")
+        self._stat.setObjectName("hint")
 
         cancel_btn = QPushButton("取消")
         cancel_btn.clicked.connect(self._on_cancel)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
         layout.addWidget(self._label)
         layout.addWidget(self._bar)
         layout.addWidget(self._stat)
         row = QHBoxLayout()
+        row.setSpacing(8)
         row.addStretch()
         row.addWidget(cancel_btn)
         layout.addLayout(row)
@@ -117,15 +123,18 @@ class LoaderInstallDialog(QDialog):
         self._stage_bars: dict[str, QProgressBar] = {}
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
         title_lbl = QLabel(f"正在安装 {loader_name}")
-        title_lbl.setStyleSheet("font-size: 14px; font-weight: 600;")
+        title_lbl.setObjectName("subtitle")
         layout.addWidget(title_lbl)
 
         # 每个阶段一行：状态点 + 阶段名 + 进度条
         for key, name in self._stages:
             row = QHBoxLayout()
+            row.setSpacing(8)
             dot = QLabel("○")
-            dot.setStyleSheet("font-size: 16px; color: #8E8E93;")
+            dot.setStyleSheet("font-size: 16px; color: #6B7280;")
             dot.setFixedWidth(20)
             lbl = QLabel(name)
             row.addWidget(dot)
@@ -141,23 +150,25 @@ class LoaderInstallDialog(QDialog):
 
         self._detail = QLabel("准备中…")
         self._detail.setWordWrap(True)
-        self._detail.setStyleSheet("color: #8E8E93; font-size: 12px;")
+        self._detail.setObjectName("hint")
         layout.addWidget(self._detail)
 
         self._log = QLabel("")
         self._log.setWordWrap(True)
         self._log.setStyleSheet(
-            "font-size: 11px; color: #48484A; background:#12141A; "
-            "padding:8px; border:1px solid #222630; max-height:120px;"
+            "font-size: 11px; color: #6B7280; background:#121317; "
+            "padding:8px; border:1px solid #2A2E39; border-radius:6px; max-height:120px;"
         )
         layout.addWidget(self._log)
 
         self._cancel_btn = QPushButton("取消")
         self._cancel_btn.clicked.connect(self._on_cancel)
         self._done_btn = QPushButton("完成")
+        self._done_btn.setObjectName("primary")
         self._done_btn.setEnabled(False)
         self._done_btn.clicked.connect(self.accept)
         row = QHBoxLayout()
+        row.setSpacing(8)
         row.addStretch()
         row.addWidget(self._cancel_btn)
         row.addWidget(self._done_btn)
@@ -172,13 +183,13 @@ class LoaderInstallDialog(QDialog):
 
     # ---------- 由工作线程经信号投递到主线程后调用 ----------
     def on_progress(self, stage: str, detail: str, pct: int) -> None:
-        # 当前阶段进行中（● 蓝色），已过阶段完成（● 绿色），未到阶段待办（○ 灰）
+        # 当前阶段进行中（● 主题色琥珀金），已过阶段完成（● 成功绿），未到阶段待办（○ 灰）
         reached = False
         for key, _ in self._stages:
             dot = self._stage_labels[key]
             if key == stage:
                 dot.setText("●")
-                dot.setStyleSheet("font-size: 16px; color: #0A84FF;")
+                dot.setStyleSheet("font-size: 16px; color: #FF9500;")
                 self._stage_bars[key].setValue(pct)
                 reached = True
             elif not reached:
@@ -187,7 +198,7 @@ class LoaderInstallDialog(QDialog):
                 self._stage_bars[key].setValue(100)
             else:
                 dot.setText("○")
-                dot.setStyleSheet("font-size: 16px; color: #48484A;")
+                dot.setStyleSheet("font-size: 16px; color: #6B7280;")
                 self._stage_bars[key].setValue(0)
         self._detail.setText(detail)
         self._log_lines.append(f"[{stage}] {detail}")
