@@ -294,13 +294,26 @@ class MainWindow(QMainWindow):
         btn_sync = QPushButton("同步条目")
         btn_sync.clicked.connect(self._on_sync)
         toolbar.addWidget(btn_sync)
+        self._btn_select_modpack = QPushButton("一键选择同整合包")
+        self._btn_select_modpack.clicked.connect(self._on_select_same_modpack)
+        toolbar.addWidget(self._btn_select_modpack)
+        self._btn_download_selected = QPushButton("下载已选")
+        self._btn_download_selected.clicked.connect(self._on_download_selected_mods)
+        toolbar.addWidget(self._btn_download_selected)
         toolbar.addStretch()
         self._mod_count = QLabel("未同步")
         toolbar.addWidget(self._mod_count)
         layout.addLayout(toolbar)
 
-        self._mod_table = QTableWidget(0, 6)
-        self._mod_table.setHorizontalHeaderLabels(["名称", "版本", "游戏", "大小", "状态", "操作"])
+        hint = QLabel(
+            "提示：先选中一个模组，点击「一键选择同整合包」可勾选同整合包下所有未安装模组（已安装自动跳过，防止重复），再点「下载已选」批量同步。"
+        )
+        hint.setStyleSheet("color: #8E8E93; font-size: 11px;")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self._mod_table = QTableWidget(0, 7)
+        self._mod_table.setHorizontalHeaderLabels(["选择", "名称", "版本", "游戏", "大小", "状态", "操作"])
         self._mod_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self._mod_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._mod_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -749,14 +762,20 @@ class MainWindow(QMainWindow):
         self._mod_table.setRowCount(len(mods))
         for i, m in enumerate(mods):
             status = self.manager.mod_status(m)
-            self._mod_table.setItem(i, 0, QTableWidgetItem(m["name"]))
-            self._mod_table.setItem(i, 1, QTableWidgetItem(m["version"]))
-            self._mod_table.setItem(i, 2, QTableWidgetItem(m["game"]))
-            self._mod_table.setItem(i, 3, QTableWidgetItem(human_size(m["file_size"])))
-            self._mod_table.setItem(i, 4, QTableWidgetItem(status.state))
+            # 列 0：选择复选框（携带 mod_id 于 UserRole，便于批量取用）
+            chk = QTableWidgetItem()
+            chk.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            chk.setCheckState(Qt.Unchecked)
+            chk.setData(Qt.UserRole, m["id"])
+            self._mod_table.setItem(i, 0, chk)
+            self._mod_table.setItem(i, 1, QTableWidgetItem(m["name"]))
+            self._mod_table.setItem(i, 2, QTableWidgetItem(m["version"]))
+            self._mod_table.setItem(i, 3, QTableWidgetItem(m["game"]))
+            self._mod_table.setItem(i, 4, QTableWidgetItem(human_size(m["file_size"])))
+            self._mod_table.setItem(i, 5, QTableWidgetItem(status.state))
             dl_btn = QPushButton("下载")
             dl_btn.clicked.connect(lambda _=False, mid=m["id"]: self._on_download_mod(mid))
-            self._mod_table.setCellWidget(i, 5, dl_btn)
+            self._mod_table.setCellWidget(i, 6, dl_btn)
         self._mod_count.setText(f"模组 {len(mods)} 个")
 
         self.statusBar().showMessage(f"同步完成：{len(data.modpacks)} 整合包 / {len(mods)} 模组", 5000)
@@ -810,6 +829,224 @@ class MainWindow(QMainWindow):
             return  # 用户取消
         # choice: ("modpack", None) 装到整合包 mods/ ; ("saveas", "D:/path") 另存为指定目录
         self._start_download("mods", mod, mod_mode=choice)
+
+    def _on_select_same_modpack(self) -> None:
+        """一键选择同整合包模组：以当前选中行所属整合包为基准，勾选该整合包下
+        所有未安装的模组；已在本地安装（installed.json 中 hash 匹配）的自动跳过，
+        防止重复同步导致游戏报错。
+        """
+        if not self.manager.last_sync or not self.manager.last_sync.mods:
+            show_info(self, "提示", "请先同步模组列表")
+            return
+        row = self._mod_table.currentRow()
+        if row < 0:
+            show_info(self, "提示", "请先在列表中选中一个模组，用于确定所属整合包")
+            return
+        chk_item = self._mod_table.item(row, 0)
+        if chk_item is None:
+            return
+        mod_id = chk_item.data(Qt.UserRole)
+        mods = [m.model_dump() for m in self.manager.last_sync.mods]
+        cur = next((m for m in mods if m["id"] == mod_id), None)
+        if not cur:
+            return
+        modpack_id = cur.get("modpack_id")
+        if not modpack_id:
+            show_info(self, "提示", f"模组「{cur['name']}」未关联任何整合包，无法批量选择")
+            return
+        mp = next((m.model_dump() for m in self.manager.last_sync.modpacks if m.id == modpack_id), None)
+        mp_name = mp["name"] if mp else modpack_id
+
+        installed = load_installed()
+        selected = 0
+        skipped = 0
+        for i in range(self._mod_table.rowCount()):
+            item = self._mod_table.item(i, 0)
+            if item is None:
+                continue
+            mid = item.data(Qt.UserRole)
+            m = next((x for x in mods if x["id"] == mid), None)
+            if not m or m.get("modpack_id") != modpack_id:
+                # 非当前整合包：保持不勾选
+                item.setCheckState(Qt.Unchecked)
+                continue
+            # 同整合包：检查本地是否已安装（hash 匹配视为已安装）
+            rec = installed.get(mid)
+            if rec and rec.get("hash") == m.get("file_hash"):
+                item.setCheckState(Qt.Unchecked)
+                skipped += 1
+            else:
+                item.setCheckState(Qt.Checked)
+                selected += 1
+        if selected == 0:
+            show_info(
+                self,
+                "无需同步",
+                f"整合包「{mp_name}」下的模组均已安装（跳过 {skipped} 个），无需同步。",
+            )
+        else:
+            self.statusBar().showMessage(
+                f"已勾选「{mp_name}」整合包 {selected} 个未安装模组（跳过 {skipped} 个已安装），点「下载已选」开始同步",
+                6000,
+            )
+
+    def _on_download_selected_mods(self) -> None:
+        """批量下载所有勾选的模组，安装到各自所属整合包的 mods/ 目录。
+
+        逐个下载并安装，已安装（hash 匹配）或目标 mods/ 下同名文件已存在的自动跳过，
+        防止模组重复导致游戏报错。
+        """
+        if not self.manager.last_sync:
+            show_info(self, "提示", "请先同步")
+            return
+        mods = [m.model_dump() for m in self.manager.last_sync.mods]
+        selected_ids: list[str] = []
+        for i in range(self._mod_table.rowCount()):
+            item = self._mod_table.item(i, 0)
+            if item is None:
+                continue
+            if item.checkState() == Qt.Checked:
+                mid = item.data(Qt.UserRole)
+                if mid:
+                    selected_ids.append(mid)
+        if not selected_ids:
+            show_info(self, "提示", "没有勾选任何模组。\n可先选中一个模组，点「一键选择同整合包」自动勾选。")
+            return
+        # 收集选中的模组元数据
+        picked = [m for m in mods if m["id"] in selected_ids]
+        if not ask_yes(
+            self,
+            "确认批量下载",
+            f"将下载并安装 {len(picked)} 个模组到各自所属整合包的 mods/ 目录。\n已安装的会自动跳过。是否继续？",
+        ):
+            return
+
+        self._cancel_event.clear()
+        self._download_dialog = DownloadProgressDialog(f"批量下载 {len(picked)} 个模组", self)
+        self._download_dialog.canceled.connect(lambda: self._cancel_event.set())
+
+        t = threading.Thread(target=self._batch_download_mods_worker, args=(picked,), daemon=True)
+        t.start()
+        self._download_dialog.exec()
+        self._download_dialog = None
+        # 刷新状态列（反映新安装的模组）
+        self._refresh_mod_table_status()
+
+    def _batch_download_mods_worker(self, mods: list[dict]) -> None:
+        """批量下载工作线程：逐个下载→安装到所属整合包 mods/→记录 installed.json。
+
+        已安装（hash 匹配）或目标 mods/ 下同名文件已存在则跳过，防止重复。
+        单个文件失败时记录错误并继续后续，最后汇总；取消则立即停止。
+        """
+        from app.installer import install_mod as _install_mod
+
+        total = len(mods)
+        done = 0
+        errors: list[str] = []
+        skipped = 0
+        try:
+            for idx, mod in enumerate(mods, 1):
+                if self._cancel_event.is_set():
+                    raise RuntimeError("已取消")
+                name = mod.get("name", mod["id"])
+                try:
+                    # 二次确认：本地已安装（hash 匹配）则跳过
+                    installed = load_installed()
+                    rec = installed.get(mod["id"])
+                    if rec and rec.get("hash") == mod.get("file_hash"):
+                        skipped += 1
+                        done += 1
+                        self._sig_status.emit(f"({idx}/{total}) 跳过已安装：{name}")
+                        continue
+                    self._sig_status.emit(f"({idx}/{total}) 下载：{name}")
+                    self._sig_progress.emit(0, 0)  # busy indicator
+                    url = self.manager.client.download_url("mods", mod["id"])
+                    local_dir = os.path.join(self.config.install_base_dir, ".cache", "mods", mod["id"])
+                    dest = os.path.join(local_dir, mod["file_name"])
+                    download_file(
+                        url,
+                        dest,
+                        expected_hash=mod["file_hash"],
+                        progress=lambda d, t: self._sig_progress.emit(d, t),
+                        cancel_event=self._cancel_event,
+                    )
+                    # 安装到所属整合包的 mods/ 目录
+                    modpack_id = mod.get("modpack_id")
+                    mp = None
+                    if modpack_id and self.manager.last_sync:
+                        mp = next(
+                            (m.model_dump() for m in self.manager.last_sync.modpacks if m.id == modpack_id),
+                            None,
+                        )
+                    if mp:
+                        # 目标 mods/ 下同名文件已存在则跳过复制（防重复）
+                        game = mp.get("game", "minecraft")
+                        adapter = GameAdapterRegistry.get(game)
+                        if adapter:
+                            modpack_dir = adapter.install_dir_hint(self.config.install_base_dir, mp)
+                        else:
+                            modpack_dir = os.path.join(
+                                self.config.install_base_dir, game, mp.get("name", "default")
+                            )
+                        target_mods = os.path.join(modpack_dir, "mods")
+                        target_file = os.path.join(target_mods, os.path.basename(dest))
+                        if os.path.isfile(target_file):
+                            skipped += 1
+                        else:
+                            _install_mod(dest, mp, self.config.install_base_dir)
+                    # 记录安装状态
+                    installed = load_installed()
+                    installed[mod["id"]] = {
+                        "kind": "mods",
+                        "hash": mod["file_hash"],
+                        "version": mod["version"],
+                        "name": mod["name"],
+                    }
+                    save_installed(installed)
+                    done += 1
+                except RuntimeError as e:
+                    if self._cancel_event.is_set() or "取消" in str(e):
+                        raise  # 取消：跳出整个批量流程
+                    errors.append(f"{name}: {e}")
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"{name}: {type(e).__name__}: {e}")
+            # 完成
+            if errors:
+                self._sig_fail.emit("部分模组下载失败", "\n".join(errors))
+            msg = f"批量同步完成：共 {total} 个，成功 {done - skipped}，跳过 {skipped}"
+            if skipped:
+                msg += "（已安装/已存在）"
+            self._sig_statusbar.emit(msg, 6000)
+            self._sig_close_dialog.emit(0)
+        except RuntimeError as e:
+            if self._cancel_event.is_set() or "取消" in str(e):
+                self._sig_close_dialog.emit(1)
+                self._sig_statusbar.emit("已取消批量下载", 3000)
+            else:
+                self._sig_fail.emit("下载失败", f"{type(e).__name__}: {e}")
+                self._sig_close_dialog.emit(1)
+        except Exception as e:  # noqa: BLE001
+            self._sig_fail.emit("下载失败", f"{type(e).__name__}: {e}")
+            self._sig_close_dialog.emit(1)
+
+    def _refresh_mod_table_status(self) -> None:
+        """批量操作后刷新模组表格的「状态」列与已安装模组的勾选状态。"""
+        if not self.manager.last_sync:
+            return
+        mods = {m.id: m.model_dump() for m in self.manager.last_sync.mods}
+        for i in range(self._mod_table.rowCount()):
+            item = self._mod_table.item(i, 0)
+            if item is None:
+                continue
+            mid = item.data(Qt.UserRole)
+            m = mods.get(mid)
+            if not m:
+                continue
+            status = self.manager.mod_status(m)
+            self._mod_table.setItem(i, 5, QTableWidgetItem(status.state))
+            # 已安装的取消勾选（保持与本地状态一致）
+            if status.state == "installed":
+                item.setCheckState(Qt.Unchecked)
 
     def _choose_mod_install_mode(self, mod: dict, modpack: dict | None) -> tuple[str, str | None] | None:
         """弹出对话框让用户选择模组安装方式。
