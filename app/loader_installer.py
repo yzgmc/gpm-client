@@ -40,6 +40,15 @@ FABRIC_INSTALLER_URL = (
 )
 FABRIC_LOADER_META = "https://meta.fabricmc.net/v2/versions/loader/{mc}"
 
+# Fabric API（基础模组，多数 Fabric 模组依赖它）：Maven 元数据 + jar 模板
+# 版本号格式如 "0.92.11+1.20.1"，"+" 后为 MC 版本
+FABRIC_API_META = (
+    "https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/maven-metadata.xml"
+)
+FABRIC_API_JAR = (
+    "https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/{ver}/fabric-api-{ver}.jar"
+)
+
 # Quilt 安装器：版本动态取最新（Maven metadata）
 QUILT_INSTALLER_META = (
     "https://maven.quiltmc.org/repository/release/org/quiltmc/quilt-installer/maven-metadata.xml"
@@ -222,6 +231,95 @@ def _install_fabric(install_dir, mc_version, loader_version, install_base_dir,
     _run_java_installer(cmd, progress, cancel_event, install_dir, "Fabric 安装")
     if progress:
         progress("install", "Fabric 安装完成", 100)
+
+    # 顺带安装 Fabric API（基础模组，多数 Fabric 模组依赖它）
+    # 失败不阻断主流程（Loader 已装好），仅告警
+    try:
+        _install_fabric_api(install_dir, mc_version, install_base_dir, progress, cancel_event)
+    except Exception as e:  # noqa: BLE001
+        if cancel_event is not None and cancel_event.is_set():
+            raise
+        if progress:
+            progress("install", f"Fabric API 安装失败（不影响 Fabric Loader）：{e}", 100)
+
+
+# ============================ Fabric API ============================
+
+def _api_version_key(ver: str) -> tuple:
+    """把 fabric-api 版本号 "+" 前的部分转成可比较元组，用于排序取最新。
+
+    例如 "0.92.11+1.20.1" → (0, 92, 11)。
+    """
+    base = ver.split("+", 1)[0]
+    nums = []
+    for p in base.split("."):
+        m = re.match(r"\d+", p)
+        nums.append(int(m.group()) if m else 0)
+    return tuple(nums)
+
+
+def _resolve_fabric_api_version(mc_version: str) -> str:
+    """从 Fabric Maven metadata 取匹配 MC 版本的最新 fabric-api 版本。
+
+    版本号格式如 "0.92.11+1.20.1"，筛选以 "+{mc_version}" 结尾的，按 API 版本号降序取首个。
+    找不到精确匹配时返回空串。
+    """
+    try:
+        text = _get_text(FABRIC_API_META)
+        candidates = re.findall(r"<version>\s*([^<]+?)\s*</version>", text)
+        suffix = "+" + mc_version
+        matched = [c for c in candidates if c.endswith(suffix)]
+        if not matched:
+            return ""
+        matched.sort(key=_api_version_key, reverse=True)
+        return matched[0]
+    except Exception:
+        return ""
+
+
+def _install_fabric_api(
+    install_dir: str,
+    mc_version: str,
+    install_base_dir: str,
+    progress: Optional[ProgressCb],
+    cancel_event: Optional[threading.Event],
+) -> None:
+    """下载 Fabric API jar 并放入 install_dir/mods/。
+
+    幂等：mods/ 下已存在任意 fabric-api jar 则跳过（避免重复）。
+    jar 缓存在 .cache/loaders/ 下复用。
+    """
+    api_ver = _resolve_fabric_api_version(mc_version)
+    if not api_ver:
+        if progress:
+            progress("install", f"未找到匹配 MC {mc_version} 的 Fabric API 版本，跳过", 100)
+        return
+
+    mods_dir = os.path.join(install_dir, "mods")
+    os.makedirs(mods_dir, exist_ok=True)
+
+    # 幂等：mods/ 下已有 fabric-api jar 则跳过
+    existing = [f for f in os.listdir(mods_dir) if f.lower().startswith("fabric-api") and f.lower().endswith(".jar")]
+    if existing:
+        if progress:
+            progress("install", f"Fabric API 已存在（{existing[0]}），跳过", 100)
+        return
+
+    # 下载到缓存（复用 _download_to_cache）
+    cache_name = f"fabric-api-{api_ver}.jar"
+    cache_path = os.path.join(_cache_dir(install_base_dir), cache_name)
+    url = FABRIC_API_JAR.format(ver=api_ver)
+    if progress:
+        progress("install", f"正在下载 Fabric API {api_ver}…", 0)
+    _download_to_cache(url, cache_path, progress, cancel_event, f"Fabric API {api_ver}")
+
+    # 复制到 mods/
+    import shutil
+
+    dest = os.path.join(mods_dir, cache_name)
+    shutil.copy2(cache_path, dest)
+    if progress:
+        progress("install", f"Fabric API {api_ver} 已安装到 mods/", 100)
 
 
 # ============================ Quilt ============================
