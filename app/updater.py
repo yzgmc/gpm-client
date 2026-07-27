@@ -209,64 +209,40 @@ def current_exe_path() -> str:
 
 
 def launch_updater_and_exit(new_exe: str) -> None:
-    """启动 updater_helper 子进程，让其替换当前 exe 后重启。
+    """启动"自身"作为升级子进程（单 exe 方案），立即退出主程序。
+
+    关键设计：不再依赖独立 updater_helper.exe，而是让主 exe 启动时检测
+    --gpm-updater 参数来执行升级逻辑。Nuitka 打包时通过 --include-module
+    嵌入 app._updater_helper 模块。
 
     流程：
-    1. 找到 updater_helper.py 的物理路径（开发态：仓库根；打包态：exe 同级）。
-    2. 用 pythonw 启动 updater_helper.py（Windows 隐藏控制台窗口）。
-    3. 立即 sys.exit(0) 退出主程序。
-
-    updater_helper 入参：
-      --new-exe <path>      新 exe 路径
-      --current-exe <path>  要被替换的当前 exe 路径
-      --restart-args ...    重启时传给新 exe 的参数
+    1. 用 sys.executable 启动自身 + --gpm-updater 参数（detach）
+    2. 立即 os._exit(0) 退出主程序（释放 exe 文件锁）
+    3. 子进程（同一个 exe）检测到 --gpm-updater → 等父进程退出 → 替换 → 重启
     """
-    # 找 updater_helper.py 路径
     if is_frozen():
-        # 打包态：updater_helper.py 与 exe 同目录（CI 拷贝过去）
-        helper_path = os.path.join(os.path.dirname(sys.executable), "updater_helper.py")
-    else:
-        # 开发态：仓库根
-        helper_path = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..", "updater_helper.py")
-        )
-
-    if not os.path.isfile(helper_path):
-        raise RuntimeError(
-            f"未找到 updater_helper.py：{helper_path}\n"
-            "打包态需将 updater_helper.py 与 exe 放在同目录。"
-        )
-
-    # 选 Python 解释器
-    if is_frozen():
-        # 打包态：updater_helper 也要打包到 exe 同级，python 解释器由 bundle 提供
-        # 这里假设 updater_helper.py 也被 Nuitka 当作 standalone 运行（CI 单独打包一份 updater_helper.exe）
-        # 简化：仍调用 python.exe（要求用户系统装了 Python）
-        python_exe = sys.executable  # 兜底：使用打包后的 exe（同 exe 是 PyInstaller bundle，含 python）
-        # 实际上 Nuitka --onefile 的 sys.executable 是当前 exe，不能用它当 python
-        # 正确做法：要求 CI 同时产出 updater_helper.exe（独立的一文件），命名约定放在 exe 同级
-        helper_exe = os.path.join(os.path.dirname(sys.executable), "updater_helper.exe")
-        if os.path.isfile(helper_exe):
-            cmd = [helper_exe, "--new-exe", new_exe, "--current-exe", current_exe_path()]
-        else:
-            # 兜底：尝试用 sys.executable 直接当 python（失败也能给清晰错误）
-            cmd = [sys.executable, helper_path, "--new-exe", new_exe, "--current-exe", current_exe_path()]
-    else:
-        # 开发态：用当前 python 解释器
-        python_exe = sys.executable
+        # 打包态：sys.executable 就是主 exe 本身
         cmd = [
-            python_exe,
-            helper_path,
+            sys.executable,
+            "--gpm-updater",
+            "--new-exe", new_exe,
+            "--current-exe", current_exe_path(),
+        ]
+    else:
+        # 开发态：用 python run.py 模拟（run.py 检测 --gpm-updater）
+        run_py = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "run.py"))
+        cmd = [
+            sys.executable,
+            run_py,
+            "--gpm-updater",
             "--new-exe", new_exe,
             "--current-exe", current_exe_path(),
         ]
 
-    # Windows：用 CREATE_NO_WINDOW 避免控制台闪烁
     creationflags = 0
     if sys.platform == "win32":
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
-    # 启动 updater_helper 子进程（detach：关掉主进程后它仍在）
     subprocess.Popen(
         cmd,
         creationflags=creationflags,

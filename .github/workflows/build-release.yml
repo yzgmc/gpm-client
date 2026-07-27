@@ -51,6 +51,8 @@ jobs:
           # 注入构建版本号到 app.version.APP_VERSION（CI 唯一标识）
           GPM_APP_VERSION: ${{ steps.tag.outputs.semver }}
         run: |
+          # 单 exe 设计：把自升级辅助模块（app._updater_helper）嵌入主 exe。
+          # 主进程通过 --gpm-updater argv 启动自身作为升级器，不再需要独立 updater_helper.exe。
           python -m nuitka --onefile --standalone `
             --windows-console-mode=disable `
             --output-filename=gpm-client.exe `
@@ -59,22 +61,10 @@ jobs:
             --enable-plugin=anti-bloat `
             --include-package=gpm_common `
             --include-package=app `
+            --include-module=app._updater_helper `
             --assume-yes-for-downloads `
             --remove-output `
             run.py
-
-      - name: Build updater_helper
-        shell: pwsh
-        run: |
-          # updater_helper.py 是独立进程（自升级时由主程序派发），
-          # 用 Nuitka 单独打包成 standalone exe（无 PySide6 依赖，启动快）。
-          python -m nuitka --onefile --standalone `
-            --windows-console-mode=disable `
-            --output-filename=updater_helper.exe `
-            --output-dir=build `
-            --assume-yes-for-downloads `
-            --remove-output `
-            updater_helper.py
 
       - name: Show build output
         shell: pwsh
@@ -97,7 +87,8 @@ jobs:
           $title = "${{ steps.tag.outputs.title }}"
           $sha256 = "${{ steps.hash.outputs.sha256 }}"
           $commitMsg = git log -1 --pretty=format:"%s"
-          gh release create $tag build/gpm-client.exe build/updater_helper.exe --target ${{ github.sha }} `
+          # 单 exe 分发：只上传 gpm-client.exe（自升级模块已嵌入）
+          gh release create $tag build/gpm-client.exe --target ${{ github.sha }} `
             --title "GPM 客户端 $title" `
             --notes "Nuitka 打包的 Windows 单文件 exe（PySide6 GUI 客户端，无控制台窗口）。
 
@@ -112,6 +103,6 @@ jobs:
 
           ## 自升级说明
           客户端内置「帮助 → 检查更新」（Ctrl+U）会调用本 Release API 自动检测、下载、校验、重启升级。
-          - 主程序: ``gpm-client.exe``
-          - 升级器: ``updater_helper.exe``（自升级辅助进程，主程序退出后运行）"
+          自升级辅助逻辑已嵌入主 exe（通过 ``--gpm-updater`` argv 重用自身进程），无需额外 .exe 文件。
+          - 主程序: ``gpm-client.exe``（唯一分发文件）"
 
