@@ -202,6 +202,17 @@ class MainWindow(QMainWindow):
             theme_menu.addAction(act)
             self._theme_actions[name] = act
 
+        # 帮助菜单：版本检查、关于
+        help_menu = mb.addMenu("帮助(&H)")
+        act_check_update = QAction("检查更新…", self)
+        act_check_update.setShortcut("Ctrl+U")
+        act_check_update.triggered.connect(self._on_check_update)
+        help_menu.addAction(act_check_update)
+        help_menu.addSeparator()
+        act_about = QAction("关于…", self)
+        act_about.triggered.connect(self._on_about)
+        help_menu.addAction(act_about)
+
         # 初始刷新菜单状态
         self._refresh_msa_menu()
 
@@ -242,6 +253,182 @@ class MainWindow(QMainWindow):
         for n, act in self._theme_actions.items():
             act.setChecked(n == name)
         self.statusBar().showMessage(f"已切换到「{self._theme_label(name)}」主题", 3000)
+
+    def _on_about(self) -> None:
+        """关于对话框：显示当前版本 + 快捷入口（检查更新 / 打开 GitHub）。"""
+        from app.version import APP_VERSION, GITHUB_OWNER, GITHUB_REPO
+
+        box = QMessageBox(self)
+        box.setWindowTitle("关于")
+        box.setIcon(QMessageBox.Information)
+        box.setTextFormat(Qt.RichText)
+        box.setText(
+            f"<h3>Game Push Manager 客户端</h3>"
+            f"<p>当前版本：<b>v{APP_VERSION}</b></p>"
+            f"<p>项目地址："
+            f"<a href='https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}'>"
+            f"github.com/{GITHUB_OWNER}/{GITHUB_REPO}</a></p>"
+        )
+        box.setStandardButtons(QMessageBox.Ok)
+        btn_check = box.addButton("检查更新", QMessageBox.ActionRole)
+        btn_check.clicked.disconnect()
+        btn_check.clicked.connect(lambda: (box.accept(), self._on_check_update()))
+        box.exec()
+
+    def _on_check_update(self) -> None:
+        """检查更新：异步查询 + 弹窗提示 + 自动下载并升级。
+
+        流程：
+        1. 禁用菜单项，弹进度提示"正在检查…"
+        2. 后台线程调 GitHub API（避免 UI 卡顿）
+        3. 有更新 → 弹确认对话框（用户点取消则中止）
+        4. 确认后弹带进度条的下载对话框
+        5. 下载完成 → 二次确认（提示升级将重启）→ 启动 updater_helper → 退出
+        """
+        from app.updater import check_for_update, download_update, launch_updater_and_exit
+        from app.version import APP_VERSION
+
+        # 进度对话框（无进度条，仅文案）
+        progress = QProgressDialog("正在查询最新版本…", "取消", 0, 0, self)
+        progress.setWindowTitle("检查更新")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+
+        # 后台线程：调用 GitHub API
+        result_box: dict = {"info": None, "error": None}
+        cancel_event = threading.Event()
+
+        def worker() -> None:
+            try:
+                result_box["info"] = check_for_update()
+            except Exception as e:  # noqa: BLE001
+                result_box["error"] = e
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+
+        # 等待线程完成（保持 UI 响应取消）
+        while t.is_alive():
+            QApplication.processEvents()
+            if progress.wasCanceled():
+                cancel_event.set()
+                return
+            time.sleep(0.05)
+        progress.close()
+
+        info = result_box["info"]
+        err = result_box["error"]
+        if err is not None:
+            show_error(self, "检查更新失败", f"无法连接更新服务器：\n{err}")
+            return
+        if info is None:
+            return
+
+        # 已是最新
+        if not info.has_update:
+            QMessageBox.information(
+                self,
+                "已是最新版本",
+                f"当前版本 v{info.current_version} 已是最新。\n"
+                f"最新版本：v{info.latest_version}",
+            )
+            self.statusBar().showMessage(f"已是最新版本 v{info.current_version}", 4000)
+            return
+
+        # 有更新：弹确认对话框
+        size_mb = info.asset_size / (1024 * 1024) if info.asset_size else 0
+        digest_line = f"\nSHA-256 校验：{'已启用' if info.digest_sha256 else '未提供'}"
+        confirm = QMessageBox(self)
+        confirm.setWindowTitle("发现新版本")
+        confirm.setIcon(QMessageBox.Information)
+        confirm.setText(
+            f"检测到新版本 v{info.latest_version}（当前 v{info.current_version}）\n\n"
+            f"资产：{info.asset_name}（{size_mb:.1f} MB）{digest_line}\n\n"
+            f"更新说明：\n{info.release_notes[:500] or '（无）'}"
+        )
+        confirm.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        confirm.button(QMessageBox.Yes).setText("立即升级")
+        confirm.button(QMessageBox.No).setText("稍后")
+        if confirm.exec() != QMessageBox.Yes:
+            return
+
+        # ===== 下载带进度条 =====
+        dl = QProgressDialog(
+            f"正在下载 v{info.latest_version}（{size_mb:.1f} MB）…",
+            "取消",
+            0,
+            100,
+            self,
+        )
+        dl.setWindowTitle("下载更新")
+        dl.setWindowModality(Qt.WindowModal)
+        dl.setValue(0)
+        dl.show()
+
+        download_done = {"path": None, "error": None}
+
+        def on_progress(downloaded: int, total: int) -> None:
+            if total > 0:
+                pct = int(downloaded * 100 / total)
+                dl.setValue(min(pct, 99))
+                mb_d = downloaded / (1024 * 1024)
+                mb_t = total / (1024 * 1024)
+                dl.setLabelText(f"正在下载 v{info.latest_version}… {mb_d:.1f} / {mb_t:.1f} MB")
+
+        def download_worker() -> None:
+            try:
+                download_done["path"] = download_update(info, progress=on_progress, cancel_event=cancel_event)
+            except Exception as e:  # noqa: BLE001
+                download_done["error"] = e
+
+        t2 = threading.Thread(target=download_worker, daemon=True)
+        t2.start()
+        while t2.is_alive():
+            QApplication.processEvents()
+            if dl.wasCanceled():
+                cancel_event.set()
+                show_info(self, "已取消", "已取消本次更新，稍后可重新检查。")
+                return
+            time.sleep(0.05)
+        dl.close()
+
+        if download_done["error"] is not None:
+            show_error(self, "下载失败", f"下载更新失败：\n{download_done['error']}")
+            return
+        new_path = download_done["path"]
+        if not new_path or not os.path.isfile(new_path):
+            show_error(self, "下载失败", "下载文件丢失，请重试。")
+            return
+
+        # ===== 最终确认 + 启动升级器 =====
+        final = QMessageBox(self)
+        final.setWindowTitle("准备升级")
+        final.setIcon(QMessageBox.Question)
+        final.setText(
+            f"新版本已下载到本地。\n\n"
+            f"点击「立即重启升级」将：\n"
+            f"  1. 关闭当前客户端\n"
+            f"  2. 用新版本替换当前程序\n"
+            f"  3. 自动启动新版本\n\n"
+            f"请确保已保存所有工作（如正在下载游戏/模组，请等待完成）。"
+        )
+        final.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        final.button(QMessageBox.Yes).setText("立即重启升级")
+        final.button(QMessageBox.No).setText("下次再说")
+        if final.exec() != QMessageBox.Yes:
+            show_info(
+                self,
+                "已暂存",
+                f"新版本已下载到：\n{new_path}\n\n下次启动时可通过「帮助 → 检查更新」继续。",
+            )
+            return
+
+        # 启动外部 updater 进程，立即退出主程序
+        try:
+            launch_updater_and_exit(new_path)
+        except Exception as e:  # noqa: BLE001
+            show_error(self, "升级失败", f"无法启动升级器：\n{e}\n\n新版本已下载到：\n{new_path}")
 
     def _on_msa_login(self) -> None:
         """微软账号登录：后台线程跑 OAuth 流程，避免阻塞 UI。"""

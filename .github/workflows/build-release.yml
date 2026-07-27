@@ -26,11 +26,30 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install git+https://github.com/yzgmc/gpm-common.git
-          pip install "PySide6>=6.6.0" "httpx>=0.27.0"
+          pip install "PySide6>=6.6.0" "httpx>=0.27.0" "packaging>=23.0"
           pip install nuitka
+
+      - name: Generate version tag
+        id: tag
+        shell: pwsh
+        run: |
+          # 每次构建独立 tag：v + UTC 时间戳 + 短 SHA，体现每次改动的过程
+          $ts = (Get-Date).ToUniversalTime().ToString("yyyyMMdd-HHmmss")
+          $sha = "${{ github.sha }}".Substring(0,7)
+          "tag=v$ts-$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "title=v$ts ($sha)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          # semver 形式：0.YY.MM.DD+ts（满足 packaging.Version 解析），注入到 APP_VERSION
+          $yy = (Get-Date).ToUniversalTime().ToString("yy")
+          $mm = (Get-Date).ToUniversalTime().ToString("MM")
+          $dd = (Get-Date).ToUniversalTime().ToString("dd")
+          $semver = "0.$yy.$mm.$dd+$ts"
+          "semver=$semver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Build with Nuitka
         shell: pwsh
+        env:
+          # 注入构建版本号到 app.version.APP_VERSION（CI 唯一标识）
+          GPM_APP_VERSION: ${{ steps.tag.outputs.semver }}
         run: |
           python -m nuitka --onefile --standalone `
             --windows-console-mode=disable `
@@ -44,19 +63,30 @@ jobs:
             --remove-output `
             run.py
 
+      - name: Build updater_helper
+        shell: pwsh
+        run: |
+          # updater_helper.py 是独立进程（自升级时由主程序派发），
+          # 用 Nuitka 单独打包成 standalone exe（无 PySide6 依赖，启动快）。
+          python -m nuitka --onefile --standalone `
+            --windows-console-mode=disable `
+            --output-filename=updater_helper.exe `
+            --output-dir=build `
+            --assume-yes-for-downloads `
+            --remove-output `
+            updater_helper.py
+
       - name: Show build output
         shell: pwsh
         run: Get-ChildItem -Path build -Recurse | Select-Object FullName, Length
 
-      - name: Generate version tag
-        id: tag
+      - name: Compute SHA-256 of main exe
+        id: hash
         shell: pwsh
         run: |
-          # 每次构建独立 tag：v + UTC 时间戳 + 短 SHA，体现每次改动的过程
-          $ts = (Get-Date).ToUniversalTime().ToString("yyyyMMdd-HHmmss")
-          $sha = "${{ github.sha }}".Substring(0,7)
-          "tag=v$ts-$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          "title=v$ts ($sha)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          # 算 SHA-256 写入 Release notes，客户端升级时会校验完整性
+          $hash = (Get-FileHash -Path build/gpm-client.exe -Algorithm SHA256).Hash.ToLower()
+          "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Upload to Release（每次构建独立 Release）
         shell: pwsh
@@ -65,8 +95,9 @@ jobs:
         run: |
           $tag = "${{ steps.tag.outputs.tag }}"
           $title = "${{ steps.tag.outputs.title }}"
+          $sha256 = "${{ steps.hash.outputs.sha256 }}"
           $commitMsg = git log -1 --pretty=format:"%s"
-          gh release create $tag build/gpm-client.exe --target ${{ github.sha }} `
+          gh release create $tag build/gpm-client.exe build/updater_helper.exe --target ${{ github.sha }} `
             --title "GPM 客户端 $title" `
             --notes "Nuitka 打包的 Windows 单文件 exe（PySide6 GUI 客户端，无控制台窗口）。
 
@@ -74,4 +105,13 @@ jobs:
           提交说明：$commitMsg
 
           配置与已安装游戏数据存放在 exe 同级 data/ 目录。
-          首次运行稍慢（自解压临时文件）。"
+          首次运行稍慢（自解压临时文件）。
+
+          ## 资产校验
+          SHA256: $sha256
+
+          ## 自升级说明
+          客户端内置「帮助 → 检查更新」（Ctrl+U）会调用本 Release API 自动检测、下载、校验、重启升级。
+          - 主程序: ``gpm-client.exe``
+          - 升级器: ``updater_helper.exe``（自升级辅助进程，主程序退出后运行）"
+
