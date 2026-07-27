@@ -42,6 +42,7 @@ from app.java_installer import ensure_java as ensure_java_runtime, _is_usable_ja
 from app.launcher import launch
 from app.loader_installer import install_loader, SUPPORTED_LOADERS
 from app.sync_manager import SyncManager
+from app.ui.theme import THEMES, apply_theme
 from app.ui.version_dialogs import CreateVersionDialog, EditVersionDialog
 from app.ui.widgets import (
     DownloadProgressDialog,
@@ -189,6 +190,18 @@ class MainWindow(QMainWindow):
         self._act_msa_status.setEnabled(False)
         account_menu.addAction(self._act_msa_status)
 
+        # 视图菜单：主题切换（深色/黑白）
+        view_menu = mb.addMenu("视图(&V)")
+        theme_menu = view_menu.addMenu("切换主题")
+        self._theme_actions: dict[str, QAction] = {}
+        for name in THEMES:
+            act = QAction(self._theme_label(name), self)
+            act.setCheckable(True)
+            act.setChecked(self.config.theme == name)
+            act.triggered.connect(lambda _=False, n=name: self._on_switch_theme(n))
+            theme_menu.addAction(act)
+            self._theme_actions[name] = act
+
         # 初始刷新菜单状态
         self._refresh_msa_menu()
 
@@ -205,6 +218,30 @@ class MainWindow(QMainWindow):
             self._act_msa_status.setText("当前：离线模式")
             self._act_msa_login.setText("微软账号登录…")
             self._act_msa_logout.setEnabled(False)
+
+    @staticmethod
+    def _theme_label(name: str) -> str:
+        """主题名 → 菜单显示文本。"""
+        return {"dark": "深色系（默认）", "light": "黑白系"}.get(name, name)
+
+    def _on_switch_theme(self, name: str) -> None:
+        """切换主题：实时刷新 QSS + 持久化到 config。
+
+        关键：setStyleSheet 会立即刷新所有已注册 QWidget（包含菜单栏），
+        顶/底色系同步切换，无割裂感。
+        """
+        if name not in THEMES or name == self.config.theme:
+            # 已是当前主题：仅同步勾选状态后返回
+            for n, act in self._theme_actions.items():
+                act.setChecked(n == self.config.theme)
+            return
+        self.config.theme = name
+        self.config.save()
+        apply_theme(QApplication.instance(), name)
+        # 同步菜单勾选状态
+        for n, act in self._theme_actions.items():
+            act.setChecked(n == name)
+        self.statusBar().showMessage(f"已切换到「{self._theme_label(name)}」主题", 3000)
 
     def _on_msa_login(self) -> None:
         """微软账号登录：后台线程跑 OAuth 流程，避免阻塞 UI。"""
@@ -308,8 +345,12 @@ class MainWindow(QMainWindow):
         self._btn_download_mp.clicked.connect(self._on_download_modpack)
         self._btn_launch = QPushButton("启动游戏")
         self._btn_launch.clicked.connect(self._on_launch)
+        self._btn_delete_mp = QPushButton("删除整合包")
+        self._btn_delete_mp.setObjectName("danger")
+        self._btn_delete_mp.clicked.connect(self._on_delete_modpack)
         btn_row.addWidget(self._btn_download_mp)
         btn_row.addWidget(self._btn_launch)
+        btn_row.addWidget(self._btn_delete_mp)
         btn_row.addStretch()
         d_layout.addLayout(btn_row)
 
@@ -876,6 +917,109 @@ class MainWindow(QMainWindow):
         self._mp_detail.setPlainText("\n".join(lines))
 
     # ---------------- 下载整合包 ----------------
+
+    def _on_delete_modpack(self) -> None:
+        """删除整合包：二次确认 → 删除文件/缓存/记录 → 状态反馈。
+
+        删除范围（彻底清理）：
+        1. 安装目录：<install_base_dir>/<game>/<modpack_name>（含 mods/、config/、logs/、saves/ 等）
+        2. 下载缓存：<install_base_dir>/.cache/modpacks/<id>
+        3. installed.json 中的整合包记录
+        4. 同 modpack_id 关联的 mods 的 installed.json 记录（被整合包带走的模组）
+
+        安全机制：
+        - 第一级：ask_yes 二次确认，显示将删除的路径
+        - 第二级：仅删除 GameAdapterRegistry 已知的游戏目录（防止误删）
+        - 异常处理：任何步骤失败立即停止，已删除的不会回滚（用户可控）
+        """
+        import shutil
+
+        item = self._mp_list.currentItem()
+        if not item:
+            show_info(self, "提示", "请先选择一个整合包")
+            return
+        mp = item.data(Qt.UserRole)
+        if not mp:
+            return
+
+        # 计算删除路径（与安装/下载逻辑保持一致）
+        try:
+            adapter = GameAdapterRegistry.require(mp["game"])
+            install_dir = adapter.install_dir_hint(self.config.install_base_dir, mp)
+        except Exception as e:  # noqa: BLE001
+            show_error(self, "无法删除", f"游戏 {mp.get('game')} 适配器未注册：{e}")
+            return
+        cache_dir = os.path.join(self.config.install_base_dir, ".cache", "modpacks", mp["id"])
+
+        # 第一级确认
+        if not ask_yes(
+            self,
+            "确认删除整合包",
+            f"确定要删除整合包「{mp['name']} v{mp['version']}」吗？\n\n"
+            f"将删除：\n"
+            f"  · 安装目录：{install_dir}\n"
+            f"  · 下载缓存：{cache_dir}\n"
+            f"  · 本地安装记录与关联模组记录\n\n"
+            f"此操作不可撤销，是否继续？",
+        ):
+            return
+
+        # 第二级确认（高破坏性操作，要求用户输入确认短语）
+        from PySide6.QtWidgets import QInputDialog
+
+        confirm_text, ok = QInputDialog.getText(
+            self,
+            "二次确认",
+            f"请输入整合包名称「{mp['name']}」以确认删除：",
+        )
+        if not ok or confirm_text.strip() != mp["name"]:
+            show_info(self, "已取消", "名称不匹配，删除操作已取消。")
+            return
+
+        # 执行删除：按"先删文件再清记录"顺序，失败立即终止
+        self.statusBar().showMessage(f"正在删除整合包「{mp['name']}」…")
+        deleted: list[str] = []
+        errors: list[str] = []
+        try:
+            # 1. 删安装目录（含 mods/、config/、logs/、saves/ 等所有子目录）
+            if os.path.isdir(install_dir):
+                shutil.rmtree(install_dir, ignore_errors=False)
+                deleted.append(f"安装目录：{install_dir}")
+            # 2. 删下载缓存
+            if os.path.isdir(cache_dir):
+                shutil.rmtree(cache_dir, ignore_errors=False)
+                deleted.append(f"下载缓存：{cache_dir}")
+            # 3. 清 installed.json：删整合包自身记录
+            # 注意：mods 的 installed.json 记录不存 modpack_id，物理 mods/ 文件随安装目录
+            # 一同被 rmtree 清掉，无需单独处理
+            installed = load_installed()
+            if mp["id"] in installed:
+                del installed[mp["id"]]
+                deleted.append("本地安装记录")
+            save_installed(installed)
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{type(e).__name__}: {e}")
+
+        # 4. 状态反馈
+        if errors:
+            show_error(
+                self,
+                "删除部分失败",
+                "部分内容未删除干净：\n" + "\n".join(errors) +
+                f"\n\n已成功删除：\n" + ("\n".join(deleted) if deleted else "（无）"),
+            )
+            self.statusBar().showMessage(f"删除部分失败：{mp['name']}", 5000)
+        else:
+            show_info(
+                self,
+                "删除完成",
+                f"整合包「{mp['name']}」已彻底删除。\n\n" + "\n".join(deleted),
+            )
+            self.statusBar().showMessage(f"已删除整合包：{mp['name']}", 5000)
+
+        # 5. 刷新列表（即使部分失败也刷新，因为已删除的内容不再显示）
+        self._on_sync_done(self.manager.last_sync) if self.manager.last_sync else self._mp_list.clear()
+        self._mp_detail.setPlainText("")
 
     def _on_download_modpack(self) -> None:
         item = self._mp_list.currentItem()

@@ -112,6 +112,8 @@ class ClientConfig:
     token: str = ""
     # 微软正版账号凭据（空表示未用微软账号登录，用离线模式启动）
     msa_credentials: dict = field(default_factory=dict)  # MsaCredentials.to_dict()
+    # 界面主题："dark"（深色系）/ "light"（黑白系）；切换时立即生效并持久化
+    theme: str = "dark"
 
     def __post_init__(self) -> None:
         if not self.reporter_id:

@@ -17,16 +17,16 @@ from PySide6.QtWidgets import QApplication
 from app.config import ClientConfig
 from app.ui.login_dialog import LoginDialog
 from app.ui.main_window import MainWindow
-from app.ui.theme import apply_dark_theme
+from app.ui.theme import apply_theme
 
 
 def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("Game Push Manager Client")
-    # 应用黑色系高质感主题（全局 QSS + 字体）
-    apply_dark_theme(app)
 
+    # 先加载配置再应用主题——按用户上次选择的主题恢复（默认 dark）
     config = ClientConfig.load()
+    apply_theme(app, config.theme)
 
     # 未登录 → 弹登录对话框
     if not config.username or not config.token:

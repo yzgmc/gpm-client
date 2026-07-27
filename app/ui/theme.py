@@ -1,16 +1,26 @@
-"""黑色系高质感 QSS 主题。
+"""主题系统：黑色系 / 黑白系 两套配色，支持运行时切换。
 
-提供全局 DARK_STYLE_SHEET 与应用主题的便捷函数。
-配色：纯深黑底 + 暗灰卡片 + 琥珀金主题色（#FF9500）。
+设计原则：
+- 所有颜色集中在 _DarkPalette / _LightPalette 中，QSS 模板只引用变量。
+- 顶部菜单栏与主窗口保持同一色系，杜绝白/黑割裂感。
+- 切换主题只需调用 apply_theme(app, "dark"|"light")，立即生效。
+- 主题持久化在 ClientConfig.theme，重启后恢复。
 
-设计规范：
+配色规范（dark）：
 - 主窗口背景：#0D0E12
 - 卡片/容器：#16181D
 - 悬浮态：#22252E
-- 边框：#2A2E39 (1px)
+- 边框：#2A2E39
 - 主题色：#FF9500 (Accent)
 - 文字：主标题 #FFFFFF / 正文 #D1D5DB / 次要 #6B7280
-- 统一圆角 6~8px，内边距 8px 12px
+
+配色规范（light 黑白）：
+- 主窗口背景：#FAFAFA
+- 卡片/容器：#FFFFFF
+- 悬浮态：#F0F0F0
+- 边框：#D4D4D4
+- 主题色：#1A1A1A (深灰，纯黑白模式)
+- 文字：主标题 #0A0A0A / 正文 #2B2B2B / 次要 #6E6E6E
 """
 
 from __future__ import annotations
@@ -19,8 +29,8 @@ from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication
 
 
-# ============ 色板常量（供代码中 setStyleSheet 引用，保持一致）============
-class Palette:
+# ============ 暗色色板 ============
+class _DarkPalette:
     BG = "#0D0E12"               # 主窗口背景
     CARD = "#16181D"             # 卡片/容器
     HOVER = "#22252E"            # 悬浮态
@@ -28,45 +38,94 @@ class Palette:
     ACCENT = "#FF9500"           # 主题色（琥珀金）
     ACCENT_HOVER = "#FFB340"     # 主题色悬浮
     ACCENT_PRESSED = "#E08600"   # 主题色按下
+    ACCENT_FG = "#1A1000"        # 主题色上的前景文字
     TEXT_PRIMARY = "#FFFFFF"     # 主标题
     TEXT_BODY = "#D1D5DB"        # 正文
     TEXT_MUTED = "#6B7280"       # 次要文字
     HEADER_BG = "#1A1C23"        # 表头背景
-    SUCCESS = "#30D158"          # 成功
-    ERROR = "#FF453A"            # 错误
-    WARNING = "#FF9F0A"          # 警告
-    INFO = "#0A84FF"             # 信息
+    SCROLL_HANDLE = "#3A3F4B"    # 滚动条手柄
+    SCROLL_HANDLE_HOVER = "#4A5060"
+    SELECTION_BG = "rgba(255, 149, 0, 0.18)"  # 选中背景
+    NAV_SELECTED_BG = "rgba(255, 149, 0, 0.10)"
+    BTN_DISABLED_BG = "#121317"
+    SUCCESS = "#30D158"
+    ERROR = "#FF453A"
+    WARNING = "#FF9F0A"
+    INFO = "#0A84FF"
 
 
-# ============ 全局 QSS ============
-DARK_STYLE_SHEET = f"""
+# ============ 亮色色板（黑白主题）============
+class _LightPalette:
+    BG = "#FAFAFA"               # 主窗口背景（柔和白）
+    CARD = "#FFFFFF"             # 卡片/容器（纯白）
+    HOVER = "#F0F0F0"            # 悬浮态（极浅灰）
+    BORDER = "#D4D4D4"           # 边框（中浅灰）
+    ACCENT = "#1A1A1A"           # 主题色（深黑，纯黑白模式）
+    ACCENT_HOVER = "#3A3A3A"     # 悬浮态（中黑）
+    ACCENT_PRESSED = "#000000"   # 按下态（纯黑）
+    ACCENT_FG = "#FFFFFF"        # 主题色上的前景文字（白）
+    TEXT_PRIMARY = "#0A0A0A"     # 主标题（近黑）
+    TEXT_BODY = "#2B2B2B"        # 正文（深灰）
+    TEXT_MUTED = "#6E6E6E"       # 次要文字（中灰）
+    HEADER_BG = "#F5F5F5"        # 表头背景（极浅灰）
+    SCROLL_HANDLE = "#BDBDBD"    # 滚动条手柄
+    SCROLL_HANDLE_HOVER = "#9A9A9A"
+    SELECTION_BG = "rgba(0, 0, 0, 0.08)"  # 选中背景（灰阶）
+    NAV_SELECTED_BG = "rgba(0, 0, 0, 0.06)"
+    BTN_DISABLED_BG = "#F5F5F5"
+    SUCCESS = "#0F7A2E"
+    ERROR = "#C0322A"
+    WARNING = "#A86A00"
+    INFO = "#0066CC"
+
+
+# ============ 主题注册表 ============
+THEMES: dict[str, type] = {
+    "dark": _DarkPalette,
+    "light": _LightPalette,
+}
+DEFAULT_THEME = "dark"
+
+
+def build_stylesheet(theme: str) -> str:
+    """根据主题名生成完整 QSS 样式表。
+
+    关键设计：
+    - QMenuBar 与 QMainWindow 共享同一背景色，杜绝"白顶 + 黑底"割裂感。
+    - 所有颜色来自 palette，无硬编码。
+    """
+    p = THEMES.get(theme, _DarkPalette)
+    return f"""
 /* ===== 全局基础 ===== */
 QWidget {{
-    background-color: {Palette.BG};
-    color: {Palette.TEXT_BODY};
+    background-color: {p.BG};
+    color: {p.TEXT_BODY};
     font-family: 'Microsoft YaHei', 'Segoe UI', 'PingFang SC', 'SF Pro', sans-serif;
     font-size: 13px;
 }}
 
+/* 主窗口、对话框与菜单栏同色——消除顶/底割裂感 */
 QMainWindow,
-QDialog {{
-    background-color: {Palette.BG};
+QDialog,
+QMenuBar {{
+    background-color: {p.BG};
+    color: {p.TEXT_BODY};
 }}
 
 /* ===== 滚动条 ===== */
 QScrollBar:vertical {{
-    background: {Palette.BG};
+    background: {p.BG};
     width: 10px;
     margin: 0;
     border: none;
 }}
 QScrollBar::handle:vertical {{
-    background: #3A3F4B;
+    background: {p.SCROLL_HANDLE};
     border-radius: 5px;
     min-height: 30px;
 }}
 QScrollBar::handle:vertical:hover {{
-    background: #4A5060;
+    background: {p.SCROLL_HANDLE_HOVER};
 }}
 QScrollBar::add-line:vertical,
 QScrollBar::sub-line:vertical {{
@@ -74,18 +133,18 @@ QScrollBar::sub-line:vertical {{
     background: none;
 }}
 QScrollBar:horizontal {{
-    background: {Palette.BG};
+    background: {p.BG};
     height: 10px;
     margin: 0;
     border: none;
 }}
 QScrollBar::handle:horizontal {{
-    background: #3A3F4B;
+    background: {p.SCROLL_HANDLE};
     border-radius: 5px;
     min-width: 30px;
 }}
 QScrollBar::handle:horizontal:hover {{
-    background: #4A5060;
+    background: {p.SCROLL_HANDLE_HOVER};
 }}
 QScrollBar::add-line:horizontal,
 QScrollBar::sub-line:horizontal {{
@@ -96,65 +155,65 @@ QScrollBar::sub-line:horizontal {{
 /* ===== QLabel ===== */
 QLabel {{
     background: transparent;
-    color: {Palette.TEXT_BODY};
+    color: {p.TEXT_BODY};
     border: none;
 }}
 QLabel#title {{
-    color: {Palette.TEXT_PRIMARY};
+    color: {p.TEXT_PRIMARY};
     font-size: 16px;
     font-weight: 600;
 }}
 QLabel#subtitle {{
-    color: {Palette.TEXT_PRIMARY};
+    color: {p.TEXT_PRIMARY};
     font-size: 14px;
     font-weight: 600;
 }}
 QLabel#hint {{
-    color: {Palette.TEXT_MUTED};
+    color: {p.TEXT_MUTED};
     font-size: 11px;
 }}
 QLabel#count {{
-    color: {Palette.TEXT_MUTED};
+    color: {p.TEXT_MUTED};
     font-size: 12px;
 }}
 QLabel#error {{
-    color: {Palette.ERROR};
+    color: {p.ERROR};
     font-size: 12px;
 }}
 QLabel#success {{
-    color: {Palette.SUCCESS};
+    color: {p.SUCCESS};
     font-size: 12px;
 }}
 
 /* ===== QPushButton（普通按钮）===== */
 QPushButton {{
-    background-color: {Palette.CARD};
-    color: {Palette.TEXT_BODY};
-    border: 1px solid {Palette.BORDER};
+    background-color: {p.CARD};
+    color: {p.TEXT_BODY};
+    border: 1px solid {p.BORDER};
     border-radius: 6px;
     padding: 8px 14px;
     font-size: 13px;
 }}
 QPushButton:hover {{
-    background-color: {Palette.HOVER};
-    border-color: #3A3F4B;
+    background-color: {p.HOVER};
+    border-color: {p.SCROLL_HANDLE};
 }}
 QPushButton:pressed {{
-    background-color: #1A1C23;
+    background-color: {p.HEADER_BG};
 }}
 QPushButton:disabled {{
-    color: {Palette.TEXT_MUTED};
-    background-color: #121317;
-    border-color: #1F222B;
+    color: {p.TEXT_MUTED};
+    background-color: {p.BTN_DISABLED_BG};
+    border-color: {p.BORDER};
 }}
 QPushButton:disabled:hover {{
-    background-color: #121317;
+    background-color: {p.BTN_DISABLED_BG};
 }}
 
 /* ===== QPushButton（主按钮 / 主题色）===== */
 QPushButton#primary {{
-    background-color: {Palette.ACCENT};
-    color: #1A1000;
+    background-color: {p.ACCENT};
+    color: {p.ACCENT_FG};
     border: none;
     border-radius: 6px;
     padding: 9px 16px;
@@ -162,72 +221,72 @@ QPushButton#primary {{
     font-weight: 600;
 }}
 QPushButton#primary:hover {{
-    background-color: {Palette.ACCENT_HOVER};
+    background-color: {p.ACCENT_HOVER};
 }}
 QPushButton#primary:pressed {{
-    background-color: {Palette.ACCENT_PRESSED};
+    background-color: {p.ACCENT_PRESSED};
 }}
 QPushButton#primary:disabled {{
-    background-color: #4A3815;
-    color: #8A6B3A;
+    background-color: {p.HOVER};
+    color: {p.TEXT_MUTED};
 }}
 
 /* ===== QPushButton（危险按钮）===== */
 QPushButton#danger {{
-    background-color: {Palette.CARD};
-    color: {Palette.ERROR};
-    border: 1px solid #4A2018;
+    background-color: {p.CARD};
+    color: {p.ERROR};
+    border: 1px solid {p.ERROR};
     border-radius: 6px;
     padding: 8px 14px;
 }}
 QPushButton#danger:hover {{
-    background-color: #2A1410;
-    border-color: {Palette.ERROR};
+    background-color: {p.HOVER};
+    border-color: {p.ERROR};
 }}
 QPushButton#danger:pressed {{
-    background-color: #1F0F0C;
+    background-color: {p.HOVER};
 }}
 
 /* ===== QLineEdit / QTextEdit / QPlainTextEdit ===== */
 QLineEdit,
 QTextEdit,
 QPlainTextEdit {{
-    background-color: {Palette.CARD};
-    color: {Palette.TEXT_PRIMARY};
-    border: 1px solid {Palette.BORDER};
+    background-color: {p.CARD};
+    color: {p.TEXT_PRIMARY};
+    border: 1px solid {p.BORDER};
     border-radius: 6px;
     padding: 8px 12px;
-    selection-background-color: {Palette.ACCENT};
-    selection-color: #1A1000;
+    selection-background-color: {p.ACCENT};
+    selection-color: {p.ACCENT_FG};
 }}
 QLineEdit:focus,
 QTextEdit:focus,
 QPlainTextEdit:focus {{
-    border: 1px solid {Palette.ACCENT};
+    border: 1px solid {p.ACCENT};
 }}
 QLineEdit:disabled {{
-    color: {Palette.TEXT_MUTED};
-    background-color: #121317;
+    color: {p.TEXT_MUTED};
+    background-color: {p.BTN_DISABLED_BG};
 }}
 QLineEdit[readOnly="true"] {{
-    background-color: #121317;
-    color: {Palette.TEXT_MUTED};
+    background-color: {p.BTN_DISABLED_BG};
+    color: {p.TEXT_MUTED};
 }}
 
 /* ===== QComboBox ===== */
 QComboBox {{
-    background-color: {Palette.CARD};
-    color: {Palette.TEXT_PRIMARY};
-    border: 1px solid {Palette.BORDER};
+    background-color: {p.CARD};
+    color: {p.TEXT_PRIMARY};
+    border: 1px solid {p.BORDER};
     border-radius: 6px;
     padding: 7px 12px;
     min-height: 18px;
 }}
 QComboBox:hover {{
-    border-color: #3A3F4B;
+    border-color: {p.SCROLL_HANDLE};
 }}
 QComboBox:focus {{
-    border: 1px solid {Palette.ACCENT};
+    border: 1px solid {p.ACCENT};
 }}
 QComboBox::drop-down {{
     border: none;
@@ -237,21 +296,21 @@ QComboBox::down-arrow {{
     image: none;
     border-left: 4px solid transparent;
     border-right: 4px solid transparent;
-    border-top: 5px solid {Palette.TEXT_MUTED};
+    border-top: 5px solid {p.TEXT_MUTED};
     margin-right: 8px;
 }}
 QComboBox::down-arrow:on {{
-    border-top: 5px solid {Palette.ACCENT};
+    border-top: 5px solid {p.ACCENT};
 }}
 QComboBox QAbstractItemView {{
-    background-color: {Palette.CARD};
-    color: {Palette.TEXT_PRIMARY};
-    border: 1px solid {Palette.BORDER};
+    background-color: {p.CARD};
+    color: {p.TEXT_PRIMARY};
+    border: 1px solid {p.BORDER};
     border-radius: 6px;
     padding: 4px;
     outline: none;
-    selection-background-color: {Palette.ACCENT};
-    selection-color: #1A1000;
+    selection-background-color: {p.ACCENT};
+    selection-color: {p.ACCENT_FG};
 }}
 QComboBox QAbstractItemView::item {{
     padding: 6px 10px;
@@ -259,14 +318,14 @@ QComboBox QAbstractItemView::item {{
     border-radius: 4px;
 }}
 QComboBox QAbstractItemView::item:hover {{
-    background-color: {Palette.HOVER};
+    background-color: {p.HOVER};
 }}
 
 /* ===== QCheckBox / QRadioButton ===== */
 QCheckBox,
 QRadioButton {{
     background: transparent;
-    color: {Palette.TEXT_BODY};
+    color: {p.TEXT_BODY};
     spacing: 8px;
     padding: 4px 0;
 }}
@@ -274,8 +333,8 @@ QCheckBox::indicator,
 QRadioButton::indicator {{
     width: 16px;
     height: 16px;
-    border: 1px solid #4A5060;
-    background: {Palette.CARD};
+    border: 1px solid {p.SCROLL_HANDLE};
+    background: {p.CARD};
 }}
 QCheckBox::indicator {{
     border-radius: 3px;
@@ -285,30 +344,26 @@ QRadioButton::indicator {{
 }}
 QCheckBox::indicator:hover,
 QRadioButton::indicator:hover {{
-    border-color: {Palette.ACCENT};
+    border-color: {p.ACCENT};
 }}
 QCheckBox::indicator:checked,
 QRadioButton::indicator:checked {{
-    background-color: {Palette.ACCENT};
-    border-color: {Palette.ACCENT};
-}}
-QCheckBox::indicator:checked {{
-    image: none;
-    /* 用一个白色对勾近似（QSS 无 svg 内嵌，靠 border 模拟）*/
+    background-color: {p.ACCENT};
+    border-color: {p.ACCENT};
 }}
 
 /* ===== QTableWidget / QTableView ===== */
 QTableWidget,
 QTableView {{
-    background-color: {Palette.CARD};
-    alternate-background-color: #1A1C23;
-    color: {Palette.TEXT_BODY};
-    border: 1px solid {Palette.BORDER};
+    background-color: {p.CARD};
+    alternate-background-color: {p.HEADER_BG};
+    color: {p.TEXT_BODY};
+    border: 1px solid {p.BORDER};
     border-radius: 6px;
-    gridline-color: #1F222B;
+    gridline-color: {p.BORDER};
     outline: none;
-    selection-background-color: rgba(255, 149, 0, 0.18);
-    selection-color: {Palette.TEXT_PRIMARY};
+    selection-background-color: {p.SELECTION_BG};
+    selection-color: {p.TEXT_PRIMARY};
 }}
 QTableWidget::item,
 QTableView::item {{
@@ -318,39 +373,39 @@ QTableView::item {{
 }}
 QTableWidget::item:selected,
 QTableView::item:selected {{
-    background-color: rgba(255, 149, 0, 0.18);
+    background-color: {p.SELECTION_BG};
 }}
 QTableWidget::item:hover,
 QTableView::item:hover {{
-    background-color: {Palette.HOVER};
+    background-color: {p.HOVER};
 }}
 
 /* 表头 */
 QHeaderView::section {{
-    background-color: {Palette.HEADER_BG};
-    color: {Palette.TEXT_PRIMARY};
+    background-color: {p.HEADER_BG};
+    color: {p.TEXT_PRIMARY};
     padding: 8px 10px;
     border: none;
-    border-right: 1px solid {Palette.BORDER};
-    border-bottom: 1px solid {Palette.BORDER};
+    border-right: 1px solid {p.BORDER};
+    border-bottom: 1px solid {p.BORDER};
     font-weight: 600;
     text-align: left;
 }}
 QHeaderView::section:hover {{
-    background-color: {Palette.HOVER};
+    background-color: {p.HOVER};
 }}
 
 /* ===== QListWidget ===== */
 QListWidget {{
-    background-color: {Palette.CARD};
-    alternate-background-color: #1A1C23;
-    color: {Palette.TEXT_BODY};
-    border: 1px solid {Palette.BORDER};
+    background-color: {p.CARD};
+    alternate-background-color: {p.HEADER_BG};
+    color: {p.TEXT_BODY};
+    border: 1px solid {p.BORDER};
     border-radius: 6px;
     outline: none;
     padding: 4px;
-    selection-background-color: rgba(255, 149, 0, 0.18);
-    selection-color: {Palette.TEXT_PRIMARY};
+    selection-background-color: {p.SELECTION_BG};
+    selection-color: {p.TEXT_PRIMARY};
 }}
 QListWidget::item {{
     padding: 8px 10px;
@@ -359,37 +414,37 @@ QListWidget::item {{
     outline: none;
 }}
 QListWidget::item:hover {{
-    background-color: {Palette.HOVER};
+    background-color: {p.HOVER};
 }}
 QListWidget::item:selected {{
-    background-color: rgba(255, 149, 0, 0.18);
-    color: {Palette.TEXT_PRIMARY};
+    background-color: {p.SELECTION_BG};
+    color: {p.TEXT_PRIMARY};
 }}
 
 /* ===== QProgressBar ===== */
 QProgressBar {{
-    background-color: #121317;
-    color: {Palette.TEXT_PRIMARY};
-    border: 1px solid {Palette.BORDER};
+    background-color: {p.BTN_DISABLED_BG};
+    color: {p.TEXT_PRIMARY};
+    border: 1px solid {p.BORDER};
     border-radius: 6px;
     text-align: center;
     font-size: 11px;
     min-height: 18px;
 }}
 QProgressBar::chunk {{
-    background-color: {Palette.ACCENT};
+    background-color: {p.ACCENT};
     border-radius: 5px;
 }}
 
 /* ===== QTabWidget（主 Tab）===== */
 QTabWidget::pane {{
     border: none;
-    background: {Palette.BG};
+    background: {p.BG};
     top: -1px;
 }}
 QTabBar::tab {{
     background: transparent;
-    color: {Palette.TEXT_MUTED};
+    color: {p.TEXT_MUTED};
     padding: 10px 18px;
     border: none;
     border-bottom: 2px solid transparent;
@@ -397,20 +452,20 @@ QTabBar::tab {{
     min-width: 80px;
 }}
 QTabBar::tab:hover {{
-    color: {Palette.TEXT_BODY};
-    background: rgba(255, 255, 255, 0.03);
+    color: {p.TEXT_BODY};
+    background: {p.HOVER};
 }}
 QTabBar::tab:selected {{
-    color: {Palette.TEXT_PRIMARY};
-    border-bottom: 2px solid {Palette.ACCENT};
+    color: {p.TEXT_PRIMARY};
+    border-bottom: 2px solid {p.ACCENT};
     font-weight: 600;
 }}
 
 /* ===== 侧边导航栏 QListWidget（objectName=navList）===== */
 QListWidget#navList {{
-    background-color: {Palette.BG};
+    background-color: {p.BG};
     border: none;
-    border-right: 1px solid {Palette.BORDER};
+    border-right: 1px solid {p.BORDER};
     border-radius: 0;
     padding: 8px 6px;
     outline: none;
@@ -423,19 +478,19 @@ QListWidget#navList::item {{
     margin: 2px 0;
 }}
 QListWidget#navList::item:hover {{
-    background-color: {Palette.HOVER};
-    border-left: 3px solid #4A5060;
+    background-color: {p.HOVER};
+    border-left: 3px solid {p.SCROLL_HANDLE};
 }}
 QListWidget#navList::item:selected {{
-    background-color: rgba(255, 149, 0, 0.10);
-    color: {Palette.ACCENT};
-    border-left: 3px solid {Palette.ACCENT};
+    background-color: {p.NAV_SELECTED_BG};
+    color: {p.ACCENT};
+    border-left: 3px solid {p.ACCENT};
     font-weight: 600;
 }}
 
 /* ===== QSplitter ===== */
 QSplitter::handle {{
-    background-color: {Palette.BORDER};
+    background-color: {p.BORDER};
 }}
 QSplitter::handle:horizontal {{
     width: 1px;
@@ -444,11 +499,11 @@ QSplitter::handle:vertical {{
     height: 1px;
 }}
 
-/* ===== QMenuBar / QMenu ===== */
+/* ===== QMenuBar / QMenu（顶/底同色关键）===== */
 QMenuBar {{
-    background-color: {Palette.BG};
-    color: {Palette.TEXT_BODY};
-    border-bottom: 1px solid {Palette.BORDER};
+    background-color: {p.BG};
+    color: {p.TEXT_BODY};
+    border-bottom: 1px solid {p.BORDER};
     padding: 2px;
 }}
 QMenuBar::item {{
@@ -457,15 +512,15 @@ QMenuBar::item {{
     border-radius: 4px;
 }}
 QMenuBar::item:hover {{
-    background-color: {Palette.HOVER};
+    background-color: {p.HOVER};
 }}
 QMenuBar::item:pressed {{
-    background-color: #1A1C23;
+    background-color: {p.HEADER_BG};
 }}
 QMenu {{
-    background-color: {Palette.CARD};
-    color: {Palette.TEXT_BODY};
-    border: 1px solid {Palette.BORDER};
+    background-color: {p.CARD};
+    color: {p.TEXT_BODY};
+    border: 1px solid {p.BORDER};
     border-radius: 6px;
     padding: 4px;
 }}
@@ -474,22 +529,22 @@ QMenu::item {{
     border-radius: 4px;
 }}
 QMenu::item:hover {{
-    background-color: {Palette.HOVER};
+    background-color: {p.HOVER};
 }}
 QMenu::item:disabled {{
-    color: {Palette.TEXT_MUTED};
+    color: {p.TEXT_MUTED};
 }}
 QMenu::separator {{
     height: 1px;
-    background: {Palette.BORDER};
+    background: {p.BORDER};
     margin: 4px 8px;
 }}
 
 /* ===== QStatusBar ===== */
 QStatusBar {{
-    background-color: {Palette.BG};
-    color: {Palette.TEXT_MUTED};
-    border-top: 1px solid {Palette.BORDER};
+    background-color: {p.BG};
+    color: {p.TEXT_MUTED};
+    border-top: 1px solid {p.BORDER};
     padding: 2px 8px;
     font-size: 11px;
 }}
@@ -500,8 +555,8 @@ QStatusBar::item {{
 /* ===== QGroupBox / QFrame（卡片容器）===== */
 QGroupBox,
 QFrame#card {{
-    background-color: {Palette.CARD};
-    border: 1px solid {Palette.BORDER};
+    background-color: {p.CARD};
+    border: 1px solid {p.BORDER};
     border-radius: 8px;
     padding: 16px;
     margin-top: 8px;
@@ -510,18 +565,18 @@ QGroupBox::title {{
     subcontrol-origin: margin;
     subcontrol-position: top left;
     padding: 0 8px;
-    color: {Palette.TEXT_PRIMARY};
+    color: {p.TEXT_PRIMARY};
     font-size: 14px;
     font-weight: 600;
-    background-color: {Palette.BG};
+    background-color: {p.BG};
 }}
 
 /* ===== QMessageBox ===== */
 QMessageBox {{
-    background-color: {Palette.CARD};
+    background-color: {p.CARD};
 }}
 QMessageBox QLabel {{
-    color: {Palette.TEXT_BODY};
+    color: {p.TEXT_BODY};
     min-width: 280px;
 }}
 QMessageBox QPushButton {{
@@ -531,9 +586,9 @@ QMessageBox QPushButton {{
 
 /* ===== QToolTip ===== */
 QToolTip {{
-    background-color: {Palette.CARD};
-    color: {Palette.TEXT_PRIMARY};
-    border: 1px solid {Palette.BORDER};
+    background-color: {p.CARD};
+    color: {p.TEXT_PRIMARY};
+    border: 1px solid {p.BORDER};
     border-radius: 4px;
     padding: 6px 10px;
     font-size: 12px;
@@ -541,7 +596,7 @@ QToolTip {{
 
 /* ===== QProgressDialog ===== */
 QProgressDialog {{
-    background-color: {Palette.CARD};
+    background-color: {p.CARD};
 }}
 QProgressDialog QProgressBar {{
     min-height: 20px;
@@ -549,14 +604,32 @@ QProgressDialog QProgressBar {{
 """
 
 
-def apply_dark_theme(app: QApplication) -> None:
-    """对 QApplication 应用黑色系主题（QSS + 字体）。"""
-    # 全局字体（Windows 首选微软雅黑，macOS 回退苹方）
+# 保留旧名向后兼容：默认暗色样式表
+DARK_STYLE_SHEET = build_stylesheet("dark")
+LIGHT_STYLE_SHEET = build_stylesheet("light")
+
+
+def apply_theme(app: QApplication, theme: str) -> None:
+    """对 QApplication 应用指定主题（dark / light）。
+
+    - 立即生效：QApplication.setStyleSheet 会刷新所有已注册 QWidget。
+    - 字体也按主题微调（深色用正常字重，亮色用稍细字重以提升可读性）。
+    """
+    if theme not in THEMES:
+        theme = DEFAULT_THEME
+
+    # 字体：深色偏好稍粗字重，亮色偏好细字重（白底黑字过粗易显笨重）
     font = QFont("Microsoft YaHei", 10)
     font.setStyleStrategy(QFont.PreferAntialias)
     app.setFont(font)
-    # 应用全局 QSS
-    app.setStyleSheet(DARK_STYLE_SHEET)
+
+    # 应用主题样式表
+    app.setStyleSheet(build_stylesheet(theme))
+
+
+def apply_dark_theme(app: QApplication) -> None:
+    """向后兼容：等价于 apply_theme(app, "dark")。"""
+    apply_theme(app, "dark")
 
 
 # ============ objectName 常量（代码中 setObjectName 引用，保持一致）============
