@@ -25,10 +25,34 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          # 国内 CI 拉取 gpm-common 用镜像 git.yzgmc.dpdns.org（github.com 直连在 runner 中通常 OK，但镜像更稳）
-          pip install git+https://git.yzgmc.dpdns.org/yzgmc/gpm-common.git
+          # 从国内镜像（git.yzgmc.dpdns.org）clone gpm-common 到本地，开发模式安装。
+          # 之前用 `pip install git+https://...` 在某些情况下会因镜像
+          # 拉取失败 / 协议限制而静默成功（实际没装上），导致 Nuitka 找不到
+          # gpm_common 包（FATAL: failed to locate package 'gpm_common'）。
+          # 改用 git clone + pip install -e .，Nuitka 一定能在 PYTHONPATH / cwd
+          # 找到包。
+          $cloneOk = $false
+          if (Test-Path ../gpm-common) { Remove-Item -Recurse -Force ../gpm-common }
+          # 优先用国内镜像
+          try {
+            git clone --depth 1 https://git.yzgmc.dpdns.org/yzgmc/gpm-common.git ../gpm-common 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0 -and (Test-Path ../gpm-common/gpm_common/__init__.py)) {
+              $cloneOk = $true
+            }
+          } catch { Write-Host "镜像 clone 失败，准备回退" }
+          # 镜像失败回退到 GitHub 源
+          if (-not $cloneOk) {
+            Write-Host "falling back to github.com"
+            git clone --depth 1 https://github.com/yzgmc/gpm-common.git ../gpm-common 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path ../gpm-common/gpm_common/__init__.py)) {
+              throw "gpm-common clone failed from both mirror and github"
+            }
+          }
+          pip install -e ../gpm-common
           pip install "PySide6>=6.6.0" "httpx>=0.27.0" "packaging>=23.0"
           pip install nuitka
+          # 验证 gpm_common 真的可被 import（Nuitka 找包的依据）
+          python -c "import gpm_common; print('gpm_common OK at:', gpm_common.__file__)"
 
       - name: Generate version tag
         id: tag
