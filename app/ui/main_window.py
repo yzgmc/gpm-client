@@ -1583,8 +1583,16 @@ class MainWindow(QMainWindow):
                 from app.installer import install_modpack as _install_modpack_full
 
                 def _modpack_progress(stage: str, detail: str, pct: int) -> None:
-                    # 子进度更新到状态栏；不直接覆盖主进度条
+                    # 子进度同时更新到状态栏（stage+detail）和主进度条（pct）
+                    # 这是修复"进度条直接跳到解压"的关键：之前只 emit status，
+                    # 主进度条一直停在 100%（来自阶段 A 的 zip 下载），看起来像卡死。
+                    # 整合包安装阶段只用 5-95% 区间（阶段 A 用 0-100%）：
+                    #   stage=parse  → 0
+                    #   stage=download → 5-65%
+                    #   stage=extract  → 70-90%
+                    #   stage=done     → 95-100%
                     self._sig_status.emit(f"[{stage}] {detail}")
+                    self._sig_progress.emit(pct, 100)
 
                 try:
                     summary = _install_modpack_full(

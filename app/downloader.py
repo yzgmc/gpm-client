@@ -229,9 +229,10 @@ async def _download_single_async(
     tmp_path: str,
     progress: Optional[ProgressCallback],
     cancel_event,
+    hash_algo: str = "sha256",
 ) -> str:
     """单线程顺序下载（不支持 Range 或文件太小时）。"""
-    hasher = hashlib.sha256()
+    hasher = hashlib.new(hash_algo)
     last_err: Optional[Exception] = None
     for attempt in range(_RETRY_ATTEMPTS):
         try:
@@ -268,44 +269,68 @@ async def _download_single_async(
 # -----------------------------------------------------------------------------
 # 入口
 # -----------------------------------------------------------------------------
+def _hash_file(path: str, algo: str) -> str:
+    """计算本地文件哈希。支持 sha1 / sha256。"""
+    import hashlib
+    h = hashlib.new(algo)
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def download_file(
     url: str,
     dest_path: str,
     expected_hash: Optional[str] = None,
+    expected_hash_alg: str = "sha256",
     progress: Optional[ProgressCallback] = None,
     cancel_event=None,
     threads: int = _DEFAULT_THREADS,
 ) -> str:
     """同步入口：内部跑 asyncio loop。
 
-    返回最终路径；若 expected_hash 给定则校验。失败抛 RuntimeError。
+    Args:
+        url: 下载 URL
+        dest_path: 本地保存路径
+        expected_hash: 期望哈希值（十六进制字符串）
+        expected_hash_alg: 期望哈希算法，支持 "sha1" / "sha256"。Modrinth manifest
+            提供 SHA1（不是 SHA256），必须显式传 "sha1" 才能校验。
+        progress: (downloaded, total) 进度回调
+        cancel_event: 取消事件
+        threads: 并发分块数
+
+    Returns:
+        最终文件路径
+
+    Raises:
+        RuntimeError: 下载失败、取消
+        ValueError: 期望哈希不匹配
     """
+    if expected_hash_alg not in ("sha1", "sha256"):
+        raise ValueError(f"不支持的哈希算法: {expected_hash_alg}")
     os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
     tmp_path = dest_path + ".part"
 
+    # 优先在已运行的事件循环里跑（PySide QThread 主循环场景），
+    # 否则新开 loop。统一逻辑替换原来嵌套 try/except 的"猜"做法。
     try:
-        actual_hash = asyncio.run(
-            _download_file_async(url, tmp_path, progress, cancel_event, threads)
-        )
+        asyncio.get_running_loop()
+        in_loop = True
     except RuntimeError:
-        # asyncio.run 会拒绝在已运行 loop 中启动
-        # 在这种环境下（PySide QThread 已挂事件循环），
-        # 用 run_coroutine_threadsafe 让 loop 执行
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # 跨线程执行：阻塞等待
-                future = asyncio.run_coroutine_threadsafe(
-                    _download_file_async(url, tmp_path, progress, cancel_event, threads),
-                    loop,
-                )
-                actual_hash = future.result()
-            else:
-                actual_hash = loop.run_until_complete(
-                    _download_file_async(url, tmp_path, progress, cancel_event, threads)
-                )
-        except RuntimeError:
-            raise
+        in_loop = False
+
+    async def _run() -> str:
+        return await _download_file_async(url, tmp_path, progress, cancel_event, threads, expected_hash_alg)
+
+    if in_loop:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(lambda: asyncio.run(_run()))
+            actual_hash = future.result()
+    else:
+        actual_hash = asyncio.run(_run())
 
     if expected_hash and actual_hash.lower() != expected_hash.lower():
         if os.path.exists(tmp_path):
@@ -313,7 +338,9 @@ def download_file(
                 os.remove(tmp_path)
             except OSError:
                 pass
-        raise ValueError(f"哈希校验失败: 期望 {expected_hash} 实际 {actual_hash}")
+        raise ValueError(
+            f"{expected_hash_alg.upper()} 校验失败: 期望 {expected_hash} 实际 {actual_hash}"
+        )
 
     os.replace(tmp_path, dest_path)
     return dest_path
@@ -325,6 +352,7 @@ async def _download_file_async(
     progress: Optional[ProgressCallback],
     cancel_event,
     threads: int,
+    hash_algo: str = "sha256",
 ) -> str:
     """异步实现。"""
     client = _get_client()
@@ -332,7 +360,7 @@ async def _download_file_async(
     use_multithread = supports_ranges and total >= _MIN_MULTITHREAD_SIZE and threads > 1
 
     if not use_multithread:
-        return await _download_single_async(client, url, tmp_path, progress, cancel_event)
+        return await _download_single_async(client, url, tmp_path, progress, cancel_event, hash_algo)
 
     # ===== 多线程分块下载 =====
     n = min(threads, max(1, total // _MIN_MULTITHREAD_SIZE))
@@ -366,7 +394,7 @@ async def _download_file_async(
         raise RuntimeError("下载已取消")
 
     # 合并 + 哈希
-    hasher = hashlib.sha256()
+    hasher = hashlib.new(hash_algo)
     with open(tmp_path, "wb") as out:
         for pp in part_paths:
             with open(pp, "rb") as pf:

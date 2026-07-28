@@ -145,8 +145,12 @@ def _run_java_installer(
 ) -> None:
     """运行 java 安装器进程，实时读取输出推进度，检查取消与退出码。
 
-    安装器本身不输出百分比，故按输出行数推进，封顶 95%（留 5% 给收尾）。
+    安装器本身不输出百分比，故按输出行数推进 + 心跳推进，封顶 95%（留 5% 给收尾）。
+    心跳：每 1 秒 tick 一次，pct 缓慢增长，避免安装器解压大文件时 readline 阻塞
+    长时间没输出导致 UI 看起来卡死。
     """
+    import time
+
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -157,6 +161,8 @@ def _run_java_installer(
         cwd=cwd,
     )
     lines_seen = 0
+    last_progress_at = time.time()
+    # 心跳占 30% 进度（line-based 占 60% + 收尾 5% + 启动 5%）；空档期 1s 涨 1%
     while True:
         if cancel_event is not None and cancel_event.is_set():
             proc.terminate()
@@ -169,12 +175,25 @@ def _run_java_installer(
         if not line:
             if proc.poll() is not None:
                 break
+            # 心跳：1s 没新行就涨 1%
+            now = time.time()
+            if progress and (now - last_progress_at) >= 1.0:
+                # 行进度与心跳取较大值
+                line_pct = min(95, lines_seen * 3)
+                heart_pct = min(95, line_pct + 5 + int((now - last_progress_at) // 1))
+                # 用更优的占位 progress
+                if heart_pct > line_pct:
+                    progress("install", f"{detail_prefix}: 处理中…", min(heart_pct, 95))
+                last_progress_at = now
+            # 短睡让出 CPU，但不要用 time.sleep(0) 死循环
+            time.sleep(0.1)
             continue
         lines_seen += 1
         text = line.strip()
         if text and progress:
-            pct = min(95, lines_seen * 5)
+            pct = min(95, lines_seen * 3)
             progress("install", f"{detail_prefix}: {text}", pct)
+            last_progress_at = time.time()
     rc = proc.wait()
     if rc != 0:
         raise RuntimeError(f"{detail_prefix}退出码 {rc}，请检查 Java 路径与网络后重试")
@@ -305,12 +324,28 @@ def _install_fabric_api(
     mods_dir = os.path.join(install_dir, "mods")
     os.makedirs(mods_dir, exist_ok=True)
 
-    # 幂等：mods/ 下已有 fabric-api jar 则跳过
-    existing = [f for f in os.listdir(mods_dir) if f.lower().startswith("fabric-api") and f.lower().endswith(".jar")]
-    if existing:
+    # 幂等：mods/ 下已有 **匹配当前 MC 版本** 的 fabric-api jar 才跳过。
+    # 只看文件名是否以 "fabric-api" 开头不够 —— 用户可能从 1.20 升到 1.21
+    # 但 mods/ 里还残留 1.20 的 jar，跳过会导致 fabric-api 加载失败崩溃。
+    # 解析文件名中的 `+<mc_version>` 段，与目标 mc_version 严格比对。
+    suffix = "+" + mc_version
+    existing_match = None
+    existing_other: list[str] = []
+    for f in os.listdir(mods_dir):
+        low = f.lower()
+        if not (low.startswith("fabric-api") and low.endswith(".jar")):
+            continue
+        if suffix in low:
+            existing_match = f
+            break
+        existing_other.append(f)
+    if existing_match:
         if progress:
-            progress("install", f"Fabric API 已存在（{existing[0]}），跳过", 100)
+            progress("install", f"Fabric API 已存在（{existing_match}），跳过", 100)
         return
+    if existing_other and progress:
+        # 提示但不阻断 —— 让用户知道旧版本残留
+        progress("install", f"发现旧版 Fabric API（{existing_other[0]}），将被覆盖", 0)
 
     # 下载到缓存（复用 _download_to_cache）
     cache_name = f"fabric-api-{api_ver}.jar"
@@ -320,9 +355,14 @@ def _install_fabric_api(
         progress("install", f"正在下载 Fabric API {api_ver}…", 0)
     _download_to_cache(url, cache_path, progress, cancel_event, f"Fabric API {api_ver}")
 
-    # 复制到 mods/
+    # 复制到 mods/，先清掉旧版（不同 mc_version 的）以免共存引发冲突
     import shutil
 
+    for old in existing_other:
+        try:
+            os.remove(os.path.join(mods_dir, old))
+        except OSError:
+            pass
     dest = os.path.join(mods_dir, cache_name)
     shutil.copy2(cache_path, dest)
     if progress:

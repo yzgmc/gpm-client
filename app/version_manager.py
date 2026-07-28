@@ -55,7 +55,7 @@ class VersionInstance:
     display_name: str = ""        # 友好显示名，空时用 version_id
     game_version: str = ""        # MC 版本（如 1.20.1）
     mod_loader: str = "vanilla"   # vanilla/fabric/forge/neoforge/quilt
-    mod_loader_version: str = ""  # 加载器版本
+    mod_loader_version: Optional[str] = ""  # 加载器版本（None 会规范化为 "" 避免写损坏 config）
     java_path: str = ""           # 空=继承全局 ClientConfig
     jvm_args: list[str] = field(default_factory=list)  # 空=继承全局
     isolated: bool = True         # True=存档/模组/配置隔离到 versions/<id>/，False=共享根
@@ -105,6 +105,9 @@ def load_instance_config(v_dir: str, version_id: str = "") -> dict:
     """读取版本目录下的 gpm_instance.json。不存在则返回空 dict。
 
     version_id 仅用于在缺失时回填，不影响已存内容。
+
+    注意：旧 config 中 mod_loader_version 可能是 null 或缺失 —— 我们统一规范化为
+    ""（避免下游 int / str 处理时崩溃）。
     """
     path = os.path.join(v_dir, INSTANCE_CONFIG_FILE)
     if not os.path.isfile(path):
@@ -115,6 +118,16 @@ def load_instance_config(v_dir: str, version_id: str = "") -> dict:
             return {}
         if version_id and not data.get("version_id"):
             data["version_id"] = version_id
+        # 规范化 loader_version：None / 缺失 / 非字符串 → ""
+        v = data.get("mod_loader_version")
+        if v is None or not isinstance(v, str):
+            data["mod_loader_version"] = ""
+        # 规范化 jvm_args：非 list → []
+        if not isinstance(data.get("jvm_args"), list):
+            data["jvm_args"] = []
+        # 规范化 isolated：非 bool → True
+        if not isinstance(data.get("isolated"), bool):
+            data["isolated"] = True
         return data
     except (OSError, json.JSONDecodeError):
         return {}
@@ -146,19 +159,51 @@ def _read_text(path: str) -> str:
 
 
 def _parse_loader_from_version_id(version_id: str, version_json: Optional[dict]) -> tuple[str, str]:
-    """从 version_id 与版本 JSON 推断 (loader, loader_version)。"""
-    vid = (version_id or "").lower()
-    if vid.startswith("fabric-loader"):
-        # fabric-loader-0.15.7-1.20.1 → loader=fabric, 取第一个版本段
-        m = re.match(r"fabric-loader-([^/]+?)-(?:\d)", version_id or "", re.IGNORECASE)
-        return "fabric", m.group(1) if m else ""
-    if vid.startswith("quilt-loader"):
-        m = re.match(r"quilt-loader-([^/]+?)-(?:\d)", version_id or "", re.IGNORECASE)
-        return "quilt", m.group(1) if m else ""
+    """从 version_id 与版本 JSON 推断 (loader, loader_version)。
+
+    version_id 典型形式：
+      - 1.20.1                                  → (vanilla, "")
+      - fabric-loader-0.15.7-1.20.1             → (fabric, "0.15.7")
+      - fabric-loader-0.15.7                    → (fabric, "0.15.7")  # 无 mc 段
+      - quilt-loader-0.20.0-1.20.4              → (quilt, "0.20.0")
+      - 1.20.1-forge-47.2.0                     → (forge, "47.2.0")
+      - neoforge-21.0.143                       → (neoforge, "21.0.143")
+
+    旧版用正则 r"fabric-loader-([^/]+?)-(?:\d)" 在没有第三段（无 mc 后缀）的
+    version_id 上匹配不到（如 `fabric-loader-0.16.0`），导致 loader_ver 永远
+    空串。改用 split 取固定位置段，更稳健。
+    """
+    vid = (version_id or "").lower().strip()
+    if not vid:
+        return "vanilla", ""
+
+    # ---- fabric / quilt：prefix-loader-VERSION[-MC] ----
+    for loader, prefix in (("fabric", "fabric-loader-"), ("quilt", "quilt-loader-")):
+        if vid.startswith(prefix):
+            rest = vid[len(prefix):]
+            # rest 形如 "0.15.7-1.20.1" 或 "0.15.7"
+            parts = rest.split("-")
+            if parts and parts[0]:
+                return loader, parts[0]
+            return loader, ""
+
+    # ---- neoforge：可能是 neoforge-VERSION 或 1.20.1-neoforge-VERSION ----
     if "neoforge" in vid:
+        # 取 neoforge- 后第一段作为版本号
+        idx = vid.find("neoforge")
+        after = vid[idx + len("neoforge"):].lstrip("-")
+        if after:
+            return "neoforge", after.split("-")[0]
         return "neoforge", ""
+
+    # ---- forge：1.20.1-forge-47.2.0 或 forge-47.2.0 ----
     if "forge" in vid:
+        idx = vid.find("forge")
+        after = vid[idx + len("forge"):].lstrip("-")
+        if after:
+            return "forge", after.split("-")[0]
         return "forge", ""
+
     return "vanilla", ""
 
 

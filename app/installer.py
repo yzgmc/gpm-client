@@ -130,6 +130,26 @@ def _extract_overrides(zf: zipfile.ZipFile, install_dir: str) -> int:
 
 # ============ 整合包安装主流程 ============
 
+def _safe_path_within(base_dir: str, candidate: str) -> str:
+    """把 candidate 解析成绝对路径并断言它在 base_dir 之下（防 zip slip）。
+
+    candidate 可以是绝对路径或相对路径；解析后必须以 base_dir 的绝对路径为前缀，
+    否则抛 ValueError。这样即便整合包 manifest 里写了 ../../etc/passwd 也写不到
+    安装目录之外。
+    """
+    base_abs = os.path.abspath(base_dir)
+    cand_abs = os.path.abspath(os.path.join(base_abs, candidate))
+    # 公共路径必须等于 base_abs 自身（不是子串前缀，避免 /a/foo vs /a/foobar 误判）
+    try:
+        common = os.path.commonpath([base_abs, cand_abs])
+    except ValueError:
+        # 不同盘符等异常情况
+        raise ValueError(f"路径越界: {candidate}")
+    if common != base_abs:
+        raise ValueError(f"路径越界: {candidate}")
+    return cand_abs
+
+
 def install_modpack(
     archive_path: str,
     install_dir: str,
@@ -190,9 +210,19 @@ def install_modpack(
             downloaded = 0
             if kind == "modrinth" and plan.get("downloads"):
                 downloads = plan["downloads"]
-                summary["total_mods"] = len(downloads)
+                total_n = len(downloads)
+                # 预估总字节（Modrinth 提供 fileSize，否则按文件名长度占位）
+                total_bytes = sum(
+                    int(d.get("size") or 0) or 1024 for d in downloads
+                ) or 1
+                # 累计已下载字节（mod 完成时累加），用于把单文件 (d, t) 映射为
+                # 全局 (cum_done + d) / total_bytes → 5-65% 进度
+                cum_done_lock = threading.Lock()
+                cum_done = 0
+
+                summary["total_mods"] = total_n
                 if progress:
-                    progress("download", f"开始下载 {len(downloads)} 个 mod…", 5)
+                    progress("download", f"开始下载 {total_n} 个 mod（{total_bytes // 1024} KB）…", 5)
                 for i, item in enumerate(downloads, 1):
                     if cancel_event is not None and cancel_event.is_set():
                         raise RuntimeError("已取消")
@@ -202,53 +232,83 @@ def install_modpack(
                     rel = item.get("path", "").lstrip("/").replace("/", os.sep)
                     if not rel:
                         continue
-                    dest = os.path.join(install_dir, rel)
-                    os.makedirs(os.path.dirname(dest) or install_dir, exist_ok=True)
-                    # 跳过已存在且校验通过
-                    if os.path.isfile(dest) and os.path.getsize(dest) > 0:
-                        sha1_expected = item.get("sha1")
-                        if sha1_expected:
-                            from gpm_common.hashing import compute_bytes_sha256
-
-                            # Modrinth 校验是 SHA1，compute_bytes_sha256 是 SHA256
-                            # 这里直接走 download_file 的 expected_hash 逻辑
-                            # 用本地 SHA1 重新算来比对成本高，干脆让 download_file 来处理
-                            pass
+                    # zip slip 防御：即使 manifest 里写了 ../ 也只写到 install_dir 下
                     try:
-                        # expected_hash: Modrinth 用的 SHA1；download_file 内部会大小写不敏感比较
-                        # 只在 dest 不存在时下载（避免重复）
-                        if not os.path.isfile(dest):
-                            download_file(
-                                url,
-                                dest,
-                                expected_hash=item.get("sha1"),
-                                cancel_event=cancel_event,
-                                progress=None,
+                        dest = _safe_path_within(install_dir, rel)
+                    except ValueError as e:
+                        summary.setdefault("warnings", []).append(f"跳过非法路径 {rel}: {e}")
+                        continue
+                    os.makedirs(os.path.dirname(dest) or install_dir, exist_ok=True)
+                    # 跳过已存在（用 size 粗略判定，避免重下）
+                    if os.path.isfile(dest) and os.path.getsize(dest) > 0:
+                        pct = 5 + int((cum_done + int(item.get("size") or 0)) * 60 / total_bytes)
+                        if progress:
+                            progress(
+                                "download",
+                                f"已存在 mod {i}/{total_n}（{os.path.basename(rel)}），跳过",
+                                min(pct, 65),
                             )
-                            downloaded += 1
-                        # 同时把 fallback_urls 留给后续扩展
+                        with cum_done_lock:
+                            cum_done += int(item.get("size") or 0) or 1024
+                        continue
+                    # 当前 mod 的预估大小（用于实时进度权重）
+                    mod_size = int(item.get("size") or 0) or 1024
+
+                    def _make_per_mod_progress(idx: int, total: int, mod_sz: int):
+                        # 闭包：捕获 cum_done_lock + cum_done 在调用时的引用
+                        last_reported_pct = [-1]
+
+                        def _cb(d: int, t: int, _idx=idx, _total=total, _msz=mod_sz,
+                                _last=last_reported_pct):
+                            with cum_done_lock:
+                                overall = cum_done + d
+                            pct = 5 + int(overall * 60 / total_bytes)
+                            pct = min(65, max(pct, 5 + int((_idx - 1) * 60 / _total)))
+                            if pct != _last[0]:
+                                _last[0] = pct
+                                if progress:
+                                    mod_pct = int(d * 100 / max(1, t))
+                                    progress(
+                                        "download",
+                                        f"下载 mod {_idx}/{_total}（{mod_pct}%）",
+                                        pct,
+                                    )
+
+                        return _cb
+
+                    try:
+                        download_file(
+                            url,
+                            dest,
+                            expected_hash=item.get("sha1"),
+                            expected_hash_alg="sha1",  # Modrinth 清单约定
+                            cancel_event=cancel_event,
+                            progress=_make_per_mod_progress(i, total_n, mod_size),
+                        )
+                        downloaded += 1
+                        with cum_done_lock:
+                            cum_done += mod_size
                     except Exception as e:  # noqa: BLE001
-                        # 单个 mod 失败不阻断整合包安装，记录在 summary
-                        # 但严重错误（如网络全断）会让所有都失败，最终抛错
-                        if "取消" in str(e):
+                        # 单个 mod 失败不阻断整合包安装
+                        if "取消" in str(e) or "Cancelled" in str(e):
                             raise
-                        # 继续下一个；标记到 summary.warnings
                         summary.setdefault("warnings", []).append(
                             f"下载 {rel} 失败: {e}"
                         )
-                    pct = 5 + int(i * 60 / max(1, len(downloads)))  # 5-65%
+                        # 失败也按预估字节推进进度，避免卡住
+                        with cum_done_lock:
+                            cum_done += mod_size
+                    # 当前 mod 完成后给个稳定 pct
+                    pct = 5 + int(cum_done * 60 / total_bytes)
                     if progress:
-                        progress(
-                            "download",
-                            f"下载 mod {i}/{len(downloads)}",
-                            pct,
-                        )
+                        progress("download", f"下载 mod {i}/{total_n}", min(pct, 65))
 
             elif kind == "curseforge" and plan.get("cf_files"):
                 cf_files = plan["cf_files"]
-                summary["total_mods"] = len(cf_files)
+                total_n = len(cf_files)
+                summary["total_mods"] = total_n
                 if progress:
-                    progress("download", f"开始解析 {len(cf_files)} 个 CurseForge mod…", 5)
+                    progress("download", f"开始解析 {total_n} 个 CurseForge mod…", 5)
                 if not server_url:
                     raise RuntimeError(
                         "CurseForge 整合包需要服务端支持（持有 CF API key），请配置服务端地址"
@@ -256,42 +316,87 @@ def install_modpack(
                 resolved = _resolve_cf_via_server(
                     cf_files, server_url, token, cancel_event
                 )
+                total_bytes = sum(
+                    int(r.get("size") or 0) or 1024 for r in resolved
+                ) or 1
+                cum_done_lock = threading.Lock()
+                cum_done = 0
                 for i, item in enumerate(resolved, 1):
                     if cancel_event is not None and cancel_event.is_set():
                         raise RuntimeError("已取消")
                     url = item.get("url") or ""
+                    file_name = item.get("fileName") or f"{item.get('projectID')}-{item.get('fileID')}.jar"
+                    mod_size = int(item.get("size") or 0) or 1024
                     if not url:
                         summary.setdefault("warnings", []).append(
                             f"CF #{item.get('projectID')}/{item.get('fileID')} 无下载 URL"
                         )
+                        with cum_done_lock:
+                            cum_done += mod_size
                         continue
-                    file_name = item.get("fileName") or f"{item.get('projectID')}-{item.get('fileID')}.jar"
                     # CurseForge 整合包的 mod 全部进 mods/（不含 sub-path）
-                    dest = os.path.join(install_dir, "mods", file_name)
-                    os.makedirs(os.path.dirname(dest) or install_dir, exist_ok=True)
-                    if not os.path.isfile(dest):
-                        try:
-                            download_file(
-                                url,
-                                dest,
-                                expected_hash=item.get("sha1"),
-                                cancel_event=cancel_event,
-                                progress=None,
-                            )
-                            downloaded += 1
-                        except Exception as e:  # noqa: BLE001
-                            if "取消" in str(e):
-                                raise
-                            summary.setdefault("warnings", []).append(
-                                f"下载 {file_name} 失败: {e}"
-                            )
-                    pct = 5 + int(i * 60 / max(1, len(resolved)))
-                    if progress:
-                        progress(
-                            "download",
-                            f"下载 mod {i}/{len(resolved)}",
-                            pct,
+                    try:
+                        dest = _safe_path_within(install_dir, os.path.join("mods", file_name))
+                    except ValueError as e:
+                        summary.setdefault("warnings", []).append(
+                            f"CF 跳过非法路径 {file_name}: {e}"
                         )
+                        with cum_done_lock:
+                            cum_done += mod_size
+                        continue
+                    os.makedirs(os.path.dirname(dest) or install_dir, exist_ok=True)
+                    if os.path.isfile(dest) and os.path.getsize(dest) > 0:
+                        if progress:
+                            pct = 5 + int(cum_done * 60 / total_bytes)
+                            progress("download", f"已存在 mod {i}/{total_n}", min(pct, 65))
+                        with cum_done_lock:
+                            cum_done += mod_size
+                        continue
+
+                    def _make_cf_progress(idx: int, total: int, msz: int):
+                        last_reported_pct = [-1]
+
+                        def _cb(d: int, t: int, _idx=idx, _total=total, _msz=msz,
+                                _last=last_reported_pct):
+                            with cum_done_lock:
+                                overall = cum_done + d
+                            pct = 5 + int(overall * 60 / total_bytes)
+                            pct = min(65, max(pct, 5 + int((_idx - 1) * 60 / _total)))
+                            if pct != _last[0]:
+                                _last[0] = pct
+                                if progress:
+                                    mod_pct = int(d * 100 / max(1, t))
+                                    progress(
+                                        "download",
+                                        f"下载 mod {_idx}/{_total}（{mod_pct}%）",
+                                        pct,
+                                    )
+
+                        return _cb
+
+                    try:
+                        download_file(
+                            url,
+                            dest,
+                            expected_hash=item.get("sha1"),
+                            expected_hash_alg="sha1",
+                            cancel_event=cancel_event,
+                            progress=_make_cf_progress(i, total_n, mod_size),
+                        )
+                        downloaded += 1
+                        with cum_done_lock:
+                            cum_done += mod_size
+                    except Exception as e:  # noqa: BLE001
+                        if "取消" in str(e) or "Cancelled" in str(e):
+                            raise
+                        summary.setdefault("warnings", []).append(
+                            f"下载 {file_name} 失败: {e}"
+                        )
+                        with cum_done_lock:
+                            cum_done += mod_size
+                    pct = 5 + int(cum_done * 60 / total_bytes)
+                    if progress:
+                        progress("download", f"下载 mod {i}/{total_n}", min(pct, 65))
 
             summary["downloaded_mods"] = downloaded
 
@@ -323,9 +428,13 @@ def install_modpack(
                     rel = name.lstrip("./")
                     if not rel:
                         continue
-                    target = os.path.join(install_dir, rel.replace("/", os.sep))
-                    os.makedirs(os.path.dirname(target) or install_dir, exist_ok=True)
+                    # zip slip 防御
+                    try:
+                        target = _safe_path_within(install_dir, rel.replace("/", os.sep))
+                    except ValueError:
+                        continue
                     if not os.path.exists(target):  # 已存在不覆盖
+                        os.makedirs(os.path.dirname(target) or install_dir, exist_ok=True)
                         with zf.open(info) as src, open(target, "wb") as dst:
                             shutil.copyfileobj(src, dst)
                         count += 1
@@ -346,33 +455,7 @@ def install_modpack(
     return summary
 
 
-# ============ 兼容旧 API ============
-
-def _legacy_install_modpack(archive_path: str, install_dir: str) -> str:
-    """旧版 install_modpack：仅解压（无在线下载）。
-
-    保留作为 fallback 路径，main_window 仍可能传入无 progress 的旧调用。
-    """
-    os.makedirs(install_dir, exist_ok=True)
-    with zipfile.ZipFile(archive_path) as zf:
-        names = zf.namelist()
-        has_overrides = any(n.startswith("overrides/") for n in names)
-        if has_overrides:
-            for info in zf.infolist():
-                if info.is_dir():
-                    continue
-                name = info.filename
-                if name.startswith("overrides/"):
-                    rel = name[len("overrides/"):]
-                    if not rel:
-                        continue
-                    target = os.path.join(install_dir, rel)
-                    os.makedirs(os.path.dirname(target), exist_ok=True)
-                    with zf.open(info) as src, open(target, "wb") as dst:
-                        dst.write(src.read())
-        else:
-            zf.extractall(install_dir)
-    return install_dir
+# ============ 单 mod 安装（用户"另存为"流程） ============
 
 
 def install_mod(file_path: str, modpack_meta: dict, install_base_dir: str, target_dir: str | None = None) -> str:
