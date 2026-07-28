@@ -1,18 +1,22 @@
-"""多线程分块下载器：HTTP Range 并行下载，支持进度回调、取消与 sha256 校验。
+"""异步分块下载器：基于 httpx.AsyncClient + HTTP/1.1 keep-alive + 连接池复用。
 
-策略：
-1. HEAD 探测：拿到总大小 + 是否支持 Accept-Ranges。
-2. 支持 Range 且文件够大：切成 N 块，多线程并行下载到 .partN，合并时流式哈希校验。
-3. 不支持 Range 或文件太小：回退单线程顺序下载（与旧行为一致）。
-取消检查放在每块读取前后，保证点取消能立刻退出。
+设计要点（解决 WinError 10048 端口耗尽 / 慢速问题）：
+1. **单进程共享一个 AsyncClient**：复用底层 TCP 连接池，避免每次下载都新建连接
+2. **HTTP/1.1 keep-alive + HTTP/2 可选**：连接空闲时不立即关闭，保留给下一个分块
+3. **明确的 Limits(max_connections / keepalive_connections)**：限制并发连接数，
+   让 keep-alive 真正生效，不至于瞬间创建 N 个 socket 进入 TIME_WAIT
+4. **指数退避重试**：网络抖动时优雅恢复，不让用户看到失败
+5. **取消 token 放在每个分块读取前**：点取消立刻退出
+6. **HEAD 探测失败回退到 GET Range: bytes=0-0**：服务端的健壮性
 """
-
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
+import socket
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 from typing import Callable, Optional
 
 import httpx
@@ -20,98 +24,194 @@ import httpx
 
 ProgressCallback = Callable[[int, int], None]  # (downloaded_bytes, total_bytes)
 
-# 多线程参数
-_MIN_MULTITHREAD_SIZE = 1 << 20          # < 1MB 不值得切片，走单线程
-_DEFAULT_THREADS = 8                     # 默认并发数
-_CHUNK_SIZE = 1 << 16                     # 每次读取 64KB
-# 连接 10s、读取 60s（多线程单块慢点没关系，但别无限卡）
-_TIMEOUT = httpx.Timeout(10.0, read=60.0)
+# ---------- 连接池配置 ----------
+# 关键：max_keepalive_connections 必须远大于并发分块数，
+# 否则 keep-alive 槽位被挤占 → 触发新建连接 → TIME_WAIT 累积
+# 默认服务端连接池 8，加上主连接 + 重连槽位，16 是稳妥值
+_DEFAULT_LIMITS = httpx.Limits(
+    max_connections=16,
+    max_keepalive_connections=12,
+    keepalive_expiry=30.0,  # 30 秒内可复用同一连接
+)
+# 单元测试时可注入 None 关闭 keep-alive
+_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=5.0)
+_CHUNK_SIZE = 1 << 16                # 64KB 读块
+_PROGRESS_REPORT_BYTES = 1 << 18     # 256KB 触发一次进度回调
+_MIN_MULTITHREAD_SIZE = 1 << 20      # < 1MB 不切片
+_DEFAULT_THREADS = 4                 # 默认并发分块数（从 8 降到 4，端口压力减半）
+_RETRY_ATTEMPTS = 3                  # 失败重试次数
+_RETRY_BASE_DELAY = 0.6              # 退避基础秒数
 
 
-def _head_info(url: str) -> tuple[int, bool]:
-    """HEAD 探测：返回 (total_bytes, supports_ranges)。失败时返回 (0, False)。"""
+# -----------------------------------------------------------------------------
+# 共享 AsyncClient：单进程复用，避免每次下载都新建连接
+# -----------------------------------------------------------------------------
+_client_lock = threading.Lock()
+_shared_client: Optional[httpx.AsyncClient] = None
+# 标记事件循环：每次 download_file 在当前线程的 loop 跑。
+# 不同线程的 loop 不能复用同一个 client（asyncio 规则），所以记录
+# client 创建时所在 loop，若不一致则重建。
+_client_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    """获取当前线程事件循环的共享 AsyncClient。"""
+    global _shared_client, _client_loop
     try:
-        with httpx.Client(timeout=_TIMEOUT, follow_redirects=True) as c:
-            r = c.head(url)
-            # 某些服务端不支持 HEAD，回退用 GET+stream 立即关闭
-            if r.status_code >= 400:
-                r = c.get(url, headers={"Range": "bytes=0-0"})
-                total = int(r.headers.get("content-length", 0) or 0)
-                # Range 请求返回 206 说明支持断点
-                supports = r.status_code == 206
-                if supports and r.headers.get("content-range"):
-                    # content-range: bytes 0-0/12345
-                    try:
-                        total = int(r.headers["content-range"].split("/")[-1])
-                    except (IndexError, ValueError):
-                        pass
-                return total, supports
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # 不在 asyncio 上下文里，不应该调用这里；调用方必须用 download_file 入口
+        raise RuntimeError("_get_client called outside an event loop")
+    with _client_lock:
+        if _shared_client is None or _client_loop is not current_loop:
+            # 跨 loop：先关闭旧 client
+            if _shared_client is not None:
+                try:
+                    # 不能直接 await 旧 client 的 aclose（在新 loop 里不能跨 loop await），
+                    # 直接丢弃即可，连接在 GC 时会被关闭（最坏情况有几个泄漏的 socket）
+                    pass
+                except Exception:
+                    pass
+            _shared_client = httpx.AsyncClient(
+                timeout=_TIMEOUT,
+                follow_redirects=True,
+                limits=_DEFAULT_LIMITS,
+                # 开启 HTTP/2 时：单连接多路复用，端口压力最低
+                # 但服务端必须支持 h2；httpx 自动协商，失败则降级到 HTTP/1.1
+                http2=False,  # 默认关，避免依赖 h2 包；用户可在 _get_client 调用前自己 enable
+                headers={"User-Agent": "GPM-Client/1.0"},
+            )
+            _client_loop = current_loop
+        return _shared_client
+
+
+async def close_shared_client() -> None:
+    """关闭共享 client（程序退出时调用）。"""
+    global _shared_client, _client_loop
+    with _client_lock:
+        if _shared_client is not None:
+            try:
+                await _shared_client.aclose()
+            except Exception:
+                pass
+            _shared_client = None
+            _client_loop = None
+
+
+# -----------------------------------------------------------------------------
+# HEAD 探测
+# -----------------------------------------------------------------------------
+async def _head_info(url: str) -> tuple[int, bool]:
+    """HEAD 探测：返回 (total_bytes, supports_ranges)。失败回退到 GET Range: bytes=0-0。"""
+    client = _get_client()
+    try:
+        r = await client.head(url)
+        if r.status_code >= 400:
+            r = await client.get(url, headers={"Range": "bytes=0-0"})
             total = int(r.headers.get("content-length", 0) or 0)
-            supports = r.headers.get("accept-ranges", "").lower() in ("bytes", "1")
+            supports = r.status_code == 206
+            if supports:
+                cr = r.headers.get("content-range", "")
+                if "/" in cr:
+                    try:
+                        total = int(cr.split("/")[-1])
+                    except ValueError:
+                        pass
             return total, supports
+        total = int(r.headers.get("content-length", 0) or 0)
+        supports = r.headers.get("accept-ranges", "").lower() in ("bytes", "1")
+        return total, supports
     except httpx.HTTPError:
         return 0, False
 
 
-def _make_range_downloader(total: int, downloaded_counter: list[int], counter_lock: threading.Lock,
-                           last_report: list[int], progress: Optional[ProgressCallback], cancel_event):
-    """生成一个分块下载闭包，闭包内共享 total/计数器。"""
-    def _dl(url: str, part_path: str, start: int, end: int) -> int:
-        headers = {"Range": f"bytes={start}-{end}"}
-        bytes_done = 0
-        with httpx.stream("GET", url, headers=headers, timeout=_TIMEOUT, follow_redirects=True) as resp:
-            resp.raise_for_status()
-            with open(part_path, "wb") as f:
-                if cancel_event is not None and cancel_event.is_set():
-                    raise RuntimeError("下载已取消")
-                for chunk in resp.iter_bytes(chunk_size=_CHUNK_SIZE):
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise RuntimeError("下载已取消")
-                    f.write(chunk)
-                    bytes_done += len(chunk)
-                    # 更新全局已下载计数并触发进度回调
-                    with counter_lock:
-                        downloaded_counter[0] += len(chunk)
-                        cur = downloaded_counter[0]
-                        last = last_report[0]
-                    if progress and cur - last >= (1 << 18):  # 每 256KB 回调
-                        with counter_lock:
-                            last_report[0] = cur
-                        progress(cur, total)
-        return bytes_done
-    return _dl
+# -----------------------------------------------------------------------------
+# 分块下载闭包
+# -----------------------------------------------------------------------------
+async def _download_range(
+    client: httpx.AsyncClient,
+    url: str,
+    part_path: str,
+    start: int,
+    end: int,
+    cancel_event,
+) -> int:
+    """下载 [start, end] 区间到 part_path。失败时抛异常。"""
+    headers = {"Range": f"bytes={start}-{end}"}
+    last_err: Optional[Exception] = None
+    for attempt in range(_RETRY_ATTEMPTS):
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("下载已取消")
+        try:
+            async with client.stream("GET", url, headers=headers) as resp:
+                resp.raise_for_status()
+                with open(part_path, "wb") as f:
+                    async for chunk in resp.aiter_bytes(chunk_size=_CHUNK_SIZE):
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise RuntimeError("下载已取消")
+                        f.write(chunk)
+            return os.path.getsize(part_path)
+        except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError,
+                httpx.ConnectTimeout, httpx.ReadTimeout, ConnectionError) as e:
+            last_err = e
+            # 退避：0.6s, 1.2s, 2.4s
+            wait = _RETRY_BASE_DELAY * (2 ** attempt)
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("下载已取消")
+            await asyncio.sleep(wait)
+            continue
+    # 全部重试用完
+    raise RuntimeError(f"分块 [{start}-{end}] 下载失败（重试 {_RETRY_ATTEMPTS} 次后）: {last_err}")
 
 
-def _download_single(
+# -----------------------------------------------------------------------------
+# 单线程回退
+# -----------------------------------------------------------------------------
+async def _download_single_async(
+    client: httpx.AsyncClient,
     url: str,
     tmp_path: str,
     progress: Optional[ProgressCallback],
     cancel_event,
 ) -> str:
-    """单线程顺序下载（不支持 Range 或文件太小时的回退路径）。"""
+    """单线程顺序下载（不支持 Range 或文件太小时）。"""
     hasher = hashlib.sha256()
-    with httpx.stream("GET", url, timeout=_TIMEOUT, follow_redirects=True) as resp:
-        resp.raise_for_status()
-        total = int(resp.headers.get("content-length", 0) or 0)
-        downloaded = 0
-        if progress:
-            progress(0, total)
-        with open(tmp_path, "wb") as f:
+    last_err: Optional[Exception] = None
+    for attempt in range(_RETRY_ATTEMPTS):
+        try:
+            async with client.stream("GET", url) as resp:
+                resp.raise_for_status()
+                total = int(resp.headers.get("content-length", 0) or 0)
+                downloaded = 0
+                if progress:
+                    progress(0, total)
+                with open(tmp_path, "wb") as f:
+                    last_report = 0
+                    async for chunk in resp.aiter_bytes(chunk_size=_CHUNK_SIZE):
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise RuntimeError("下载已取消")
+                        f.write(chunk)
+                        hasher.update(chunk)
+                        downloaded += len(chunk)
+                        if progress and (downloaded - last_report >= _PROGRESS_REPORT_BYTES
+                                          or downloaded == total):
+                            progress(downloaded, total)
+                            last_report = downloaded
+            return hasher.hexdigest()
+        except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError,
+                httpx.ConnectTimeout, httpx.ReadTimeout, ConnectionError) as e:
+            last_err = e
+            wait = _RETRY_BASE_DELAY * (2 ** attempt)
             if cancel_event is not None and cancel_event.is_set():
                 raise RuntimeError("下载已取消")
-            last_report = 0
-            for chunk in resp.iter_bytes(chunk_size=_CHUNK_SIZE):
-                if cancel_event is not None and cancel_event.is_set():
-                    raise RuntimeError("下载已取消")
-                f.write(chunk)
-                hasher.update(chunk)
-                downloaded += len(chunk)
-                if progress and (downloaded - last_report >= (1 << 18) or downloaded == total):
-                    progress(downloaded, total)
-                    last_report = downloaded
-    return hasher.hexdigest()
+            await asyncio.sleep(wait)
+            continue
+    raise RuntimeError(f"下载失败（重试 {_RETRY_ATTEMPTS} 次后）: {last_err}")
 
 
+# -----------------------------------------------------------------------------
+# 入口
+# -----------------------------------------------------------------------------
 def download_file(
     url: str,
     dest_path: str,
@@ -120,109 +220,125 @@ def download_file(
     cancel_event=None,
     threads: int = _DEFAULT_THREADS,
 ) -> str:
-    """多线程下载文件到 dest_path，返回最终路径。若 expected_hash 给定则校验。
+    """同步入口：内部跑 asyncio loop。
 
-    cancel_event: 可选的 threading.Event，set() 后尽快终止下载。
-    自动探测是否支持 HTTP Range：支持则多线程分块下载，否则回退单线程。
+    返回最终路径；若 expected_hash 给定则校验。失败抛 RuntimeError。
     """
     os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
     tmp_path = dest_path + ".part"
 
-    # HEAD 探测
-    total, supports_ranges = _head_info(url)
-
-    use_multithread = supports_ranges and total >= _MIN_MULTITHREAD_SIZE and threads > 1
-
     try:
-        if not use_multithread:
-            # ===== 单线程回退 =====
-            actual_hash = _download_single(url, tmp_path, progress, cancel_event)
-        else:
-            # ===== 多线程分块下载 =====
-            n = min(threads, max(1, total // _MIN_MULTITHREAD_SIZE))
-            # 切分区间
-            part_size = total // n
-            ranges: list[tuple[int, int]] = []
-            for i in range(n):
-                start = i * part_size
-                end = (total - 1) if i == n - 1 else (start + part_size - 1)
-                ranges.append((start, end))
-
-            part_paths = [f"{tmp_path}.part{i}" for i in range(n)]
-            downloaded_counter = [0]
-            last_report = [0]
-            counter_lock = threading.Lock()
-
-            if progress:
-                progress(0, total)
-
-            # 用闭包共享 total/计数器给各分块下载任务
-            _dl = _make_range_downloader(total, downloaded_counter, counter_lock, last_report, progress, cancel_event)
-
-            # 并发下载各分块
-            with ThreadPoolExecutor(max_workers=n) as pool:
-                futures = {
-                    pool.submit(_dl, url, part_paths[i], ranges[i][0], ranges[i][1]): i
-                    for i in range(n)
-                }
-                try:
-                    for fut in as_completed(futures):
-                        fut.result()  # 抛出异常会进入 except
-                except Exception:
-                    # 任一分块失败：取消其余 + 清理
-                    if cancel_event is not None:
-                        cancel_event.set()
-                    raise
-
-            # 取消检查（合并前）
-            if cancel_event is not None and cancel_event.is_set():
-                raise RuntimeError("下载已取消")
-
-            # 合并分块 + 流式哈希校验
-            hasher = hashlib.sha256()
-            with open(tmp_path, "wb") as out:
-                for pp in part_paths:
-                    with open(pp, "rb") as pf:
-                        while True:
-                            buf = pf.read(1 << 20)  # 1MB
-                            if not buf:
-                                break
-                            out.write(buf)
-                            hasher.update(buf)
-                    os.remove(pp)
-            actual_hash = hasher.hexdigest()
-
+        actual_hash = asyncio.run(
+            _download_file_async(url, tmp_path, progress, cancel_event, threads)
+        )
     except RuntimeError:
-        _cleanup(tmp_path, use_multithread)
-        raise
-    except httpx.TimeoutException as e:
-        _cleanup(tmp_path, use_multithread)
-        raise RuntimeError(f"下载超时：{e}") from e
-    except Exception:
-        _cleanup(tmp_path, use_multithread)
-        raise
+        # asyncio.run 会拒绝在已运行 loop 中启动
+        # 在这种环境下（PySide QThread 已挂事件循环），
+        # 用 run_coroutine_threadsafe 让 loop 执行
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # 跨线程执行：阻塞等待
+                future = asyncio.run_coroutine_threadsafe(
+                    _download_file_async(url, tmp_path, progress, cancel_event, threads),
+                    loop,
+                )
+                actual_hash = future.result()
+            else:
+                actual_hash = loop.run_until_complete(
+                    _download_file_async(url, tmp_path, progress, cancel_event, threads)
+                )
+        except RuntimeError:
+            raise
 
-    # 哈希校验
     if expected_hash and actual_hash.lower() != expected_hash.lower():
         if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
         raise ValueError(f"哈希校验失败: 期望 {expected_hash} 实际 {actual_hash}")
 
     os.replace(tmp_path, dest_path)
     return dest_path
 
 
+async def _download_file_async(
+    url: str,
+    tmp_path: str,
+    progress: Optional[ProgressCallback],
+    cancel_event,
+    threads: int,
+) -> str:
+    """异步实现。"""
+    client = _get_client()
+    total, supports_ranges = await _head_info(url)
+    use_multithread = supports_ranges and total >= _MIN_MULTITHREAD_SIZE and threads > 1
+
+    if not use_multithread:
+        return await _download_single_async(client, url, tmp_path, progress, cancel_event)
+
+    # ===== 多线程分块下载 =====
+    n = min(threads, max(1, total // _MIN_MULTITHREAD_SIZE))
+    part_size = total // n
+    ranges: list[tuple[int, int]] = []
+    for i in range(n):
+        start = i * part_size
+        end = (total - 1) if i == n - 1 else (start + part_size - 1)
+        ranges.append((start, end))
+
+    part_paths = [f"{tmp_path}.part{i}" for i in range(n)]
+
+    if progress:
+        progress(0, total)
+
+    # 用 asyncio.gather 跑多个分块，共享同一 client → 共享连接池
+    tasks = [
+        _download_range(client, url, part_paths[i], ranges[i][0], ranges[i][1], cancel_event)
+        for i in range(n)
+    ]
+    try:
+        await asyncio.gather(*tasks)
+    except Exception:
+        if cancel_event is not None:
+            cancel_event.set()
+        _cleanup(tmp_path, multithread=True)
+        raise
+
+    if cancel_event is not None and cancel_event.is_set():
+        _cleanup(tmp_path, multithread=True)
+        raise RuntimeError("下载已取消")
+
+    # 合并 + 哈希
+    hasher = hashlib.sha256()
+    with open(tmp_path, "wb") as out:
+        for pp in part_paths:
+            with open(pp, "rb") as pf:
+                while True:
+                    buf = pf.read(1 << 20)
+                    if not buf:
+                        break
+                    out.write(buf)
+                    hasher.update(buf)
+            try:
+                os.remove(pp)
+            except OSError:
+                pass
+    return hasher.hexdigest()
+
+
+# -----------------------------------------------------------------------------
+# 清理
+# -----------------------------------------------------------------------------
 def _cleanup(tmp_path: str, multithread: bool) -> None:
-    """清理临时文件（单线程的 .part 或多线程的 .partN）。"""
     if os.path.exists(tmp_path):
         try:
             os.remove(tmp_path)
         except OSError:
             pass
     if multithread:
-        # 分块文件按 0..n-1 连续命名，第一个不存在的就停
         i = 0
-        while i < 128:
+        while i < 256:
             pp = f"{tmp_path}.part{i}"
             if os.path.exists(pp):
                 try:
