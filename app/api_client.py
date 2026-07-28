@@ -7,6 +7,7 @@ from typing import Any, Optional
 import httpx
 
 from gpm_common import SyncResponse
+from app.downloader import get_sync_client
 
 
 class ApiClient:
@@ -20,19 +21,19 @@ class ApiClient:
         return f"{self.base_url}/api/v1{path}"
 
     def sync(self) -> SyncResponse:
-        with httpx.Client(timeout=self._timeout) as c:
+        with get_sync_client() as c:
             r = c.get(self._url("/sync"))
             r.raise_for_status()
             return SyncResponse(**r.json())
 
     def list_modpacks(self) -> list[dict]:
-        with httpx.Client(timeout=self._timeout) as c:
+        with get_sync_client() as c:
             r = c.get(self._url("/modpacks"))
             r.raise_for_status()
             return r.json().get("modpacks", [])
 
     def list_mods(self) -> list[dict]:
-        with httpx.Client(timeout=self._timeout) as c:
+        with get_sync_client() as c:
             r = c.get(self._url("/mods"))
             r.raise_for_status()
             return r.json().get("mods", [])
@@ -43,7 +44,7 @@ class ApiClient:
 
     def server_status(self) -> Optional[dict]:
         try:
-            with httpx.Client(timeout=self._timeout) as c:
+            with get_sync_client() as c:
                 r = c.get(self._url("/status"))
                 r.raise_for_status()
                 return r.json()

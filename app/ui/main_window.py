@@ -305,7 +305,10 @@ class MainWindow(QMainWindow):
 
         def worker() -> None:
             try:
-                result_box["info"] = check_for_update()
+                # 优先通过服务端 /api/v1/client-update/latest 检查
+                # （国内友好：服务端可持有 GitHub token 提升 rate limit、可缓存）
+                # 失败时 updater 自动 fallback 到 GitHub API
+                result_box["info"] = check_for_update(server_url=self.config.server_url)
             except Exception as e:  # noqa: BLE001
                 result_box["error"] = e
 
@@ -318,7 +321,7 @@ class MainWindow(QMainWindow):
             time.sleep(0.1)
             elapsed += 0.1
             if int(elapsed * 10) % 10 == 0:  # 每秒
-                self.statusBar().showMessage(f"⟳ 正在查询 GitHub Releases… ({int(elapsed)}s)")
+                self.statusBar().showMessage(f"⟳ 正在检查更新（服务端优先）… ({int(elapsed)}s)")
 
         # 恢复菜单
         if hasattr(self, "_update_action") and self._update_action is not None:
@@ -1574,7 +1577,34 @@ class MainWindow(QMainWindow):
                     install_dir = adapter.install_dir_hint(self.config.install_base_dir, item)
                 else:
                     install_dir = os.path.join(self.config.install_base_dir, item["game"], item["name"])
-                install_modpack(dest, install_dir)
+                # 用新 installer 流程：解析 modrinth.index.json / manifest.json，
+                # 在线下载 mod（Modrinth 直连，CurseForge 走后端 /curseforge/resolve），
+                # 最后释放 overrides/。参考 PCL2 / HMCL / Modrinth App 行为。
+                from app.installer import install_modpack as _install_modpack_full
+
+                def _modpack_progress(stage: str, detail: str, pct: int) -> None:
+                    # 子进度更新到状态栏；不直接覆盖主进度条
+                    self._sig_status.emit(f"[{stage}] {detail}")
+
+                try:
+                    summary = _install_modpack_full(
+                        dest,
+                        install_dir,
+                        server_url=self.config.server_url,
+                        token=self.config.token,
+                        progress=_modpack_progress,
+                        cancel_event=self._cancel_event,
+                    )
+                    if summary.get("warnings"):
+                        # 非致命：状态栏提示，但仍然算安装成功
+                        warns = "; ".join(summary["warnings"][:3])
+                        self._sig_status.emit(f"安装完成（{len(summary['warnings'])} 个警告）")
+                        print(f"[installer] 警告: {warns}")
+                except RuntimeError as e:
+                    if self._cancel_event.is_set() or "取消" in str(e):
+                        self._sig_close_dialog.emit(1)
+                        return
+                    raise
             else:
                 # 模组：根据用户选择的安装方式处理
                 # mod_mode: ("modpack", None) 装到整合包 mods/ ; ("saveas", path) 另存为指定目录

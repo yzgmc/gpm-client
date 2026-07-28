@@ -37,6 +37,11 @@ from typing import Callable, Optional
 
 import httpx
 
+# 共享同步 httpx 客户端（来自 downloader）：
+# 所有 httpx 调用都复用同一连接池，避免每个调用方各自 new 一个 client 导致
+# WinError 10048 端口耗尽。
+from app.downloader import get_sync_client
+
 
 # 进度回调签名: (stage, detail, percent)
 #   stage ∈ {"download", "extract", "done", "error"}
@@ -187,8 +192,9 @@ def _resolve_tuna_zip_url(major: int) -> Optional[str]:
     """
     list_url = _TUNA_LIST_URL.format(ver=major)
     try:
-        with httpx.Client(timeout=15.0, follow_redirects=True) as c:
-            r = c.get(list_url)
+        # 复用进程级共享 client，连接池不重新创建（避免 WinError 10048 端口耗尽）
+        with get_sync_client() as c:
+            r = c.get(list_url, timeout=15.0, follow_redirects=True)
             r.raise_for_status()
             html = r.text
     except Exception:
@@ -236,21 +242,23 @@ def _download_java_zip(
         if progress:
             progress("download", f"正在从{label}下载 Java {major}…", 0)
         try:
-            with httpx.stream("GET", url, timeout=_HTTP_TIMEOUT, follow_redirects=True) as resp:
-                resp.raise_for_status()
-                total = int(resp.headers.get("content-length", 0) or 0)
-                done = 0
-                last = -1
-                with open(tmp, "wb") as f:
-                    for chunk in resp.iter_bytes(chunk_size=1 << 16):
-                        if cancel_event is not None and cancel_event.is_set():
-                            raise RuntimeError("已取消")
-                        f.write(chunk)
-                        done += len(chunk)
-                        pct = int(done * 100 / total) if total else 0
-                        if progress and pct != last:
-                            last = pct
-                            progress("download", f"下载 Java {major}（{label}）… {pct}%", pct)
+            # 复用进程级共享 client，连接池不重新创建（避免 WinError 10048 端口耗尽）
+            with get_sync_client() as client:
+                with client.stream("GET", url, timeout=_HTTP_TIMEOUT, follow_redirects=True) as resp:
+                    resp.raise_for_status()
+                    total = int(resp.headers.get("content-length", 0) or 0)
+                    done = 0
+                    last = -1
+                    with open(tmp, "wb") as f:
+                        for chunk in resp.iter_bytes(chunk_size=1 << 16):
+                            if cancel_event is not None and cancel_event.is_set():
+                                raise RuntimeError("已取消")
+                            f.write(chunk)
+                            done += len(chunk)
+                            pct = int(done * 100 / total) if total else 0
+                            if progress and pct != last:
+                                last = pct
+                                progress("download", f"下载 Java {major}（{label}）… {pct}%", pct)
             os.replace(tmp, zip_path)
             if progress:
                 progress("download", f"Java 安装包下载完成（{label}）", 100)

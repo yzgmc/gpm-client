@@ -34,7 +34,9 @@ _DEFAULT_LIMITS = httpx.Limits(
     keepalive_expiry=30.0,  # 30 秒内可复用同一连接
 )
 # 单元测试时可注入 None 关闭 keep-alive
-_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=5.0)
+# 读超时给到 300s：覆盖 Java 安装包下载（200MB+，慢网络需要较长 timeout）。
+# 单个 stream 调用方可以在 client.stream(method, url, timeout=...) 中再覆盖。
+_TIMEOUT = httpx.Timeout(connect=15.0, read=300.0, write=30.0, pool=10.0)
 _CHUNK_SIZE = 1 << 16                # 64KB 读块
 _PROGRESS_REPORT_BYTES = 1 << 18     # 256KB 触发一次进度回调
 _MIN_MULTITHREAD_SIZE = 1 << 20      # < 1MB 不切片
@@ -52,6 +54,47 @@ _shared_client: Optional[httpx.AsyncClient] = None
 # 不同线程的 loop 不能复用同一个 client（asyncio 规则），所以记录
 # client 创建时所在 loop，若不一致则重建。
 _client_loop: Optional[asyncio.AbstractEventLoop] = None
+
+# 同步共享 client：给所有 installer / api_client / msa_auth 等用。
+# 这是修复 WinError 10048 端口耗尽的核心：所有 httpx 调用复用同一个
+# 连接池，不再每个调用方各自 new 一个 client。
+_shared_sync_client: Optional[httpx.Client] = None
+
+
+def get_sync_client() -> httpx.Client:
+    """获取进程级共享同步 httpx.Client。
+
+    所有 HTTP 调用方（installer / api / msa / login / updater / version_manager）
+    都应通过此函数获取 client，而不是 with httpx.Client(...) 新建。
+    这样 keep-alive 连接在多次调用间复用，避免 WinError 10048 端口耗尽。
+    """
+    global _shared_sync_client
+    if _shared_sync_client is None:
+        with _client_lock:
+            if _shared_sync_client is None:
+                _shared_sync_client = httpx.Client(
+                    timeout=_TIMEOUT,
+                    follow_redirects=True,
+                    limits=httpx.Limits(
+                        max_connections=16,
+                        max_keepalive_connections=12,
+                        keepalive_expiry=30.0,
+                    ),
+                    headers={"User-Agent": "GPM-Client/1.0"},
+                )
+    return _shared_sync_client
+
+
+def close_sync_client() -> None:
+    """关闭共享同步 client。"""
+    global _shared_sync_client
+    with _client_lock:
+        if _shared_sync_client is not None:
+            try:
+                _shared_sync_client.close()
+            except Exception:
+                pass
+            _shared_sync_client = None
 
 
 def _get_client() -> httpx.AsyncClient:

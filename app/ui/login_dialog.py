@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import httpx
+from app.downloader import get_sync_client
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog,
@@ -92,7 +93,7 @@ class LoginDialog(QDialog):
         self._msg.setText("")
 
         try:
-            with httpx.Client(timeout=10.0) as c:
+            with get_sync_client() as c:
                 r = c.post(
                     f"{server}/api/v1/auth/login",
                     json={"username": user, "password": pwd},

@@ -25,6 +25,7 @@ from typing import Optional
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
+from app.downloader import get_sync_client
 
 
 # ============ 配置 ============
@@ -161,7 +162,7 @@ def _exchange_code_for_ms_token(code: str) -> dict:
         "redirect_uri": REDIRECT_URI,
         "scope": SCOPE,
     }
-    with httpx.Client(timeout=_HTTP_TIMEOUT) as c:
+    with get_sync_client() as c:
         r = c.post(MS_TOKEN, data=data)
         r.raise_for_status()
         j = r.json()
@@ -184,7 +185,7 @@ def _refresh_ms_token(refresh_token: str) -> dict:
         "refresh_token": refresh_token,
         "scope": SCOPE,
     }
-    with httpx.Client(timeout=_HTTP_TIMEOUT) as c:
+    with get_sync_client() as c:
         r = c.post(MS_TOKEN, data=data)
         r.raise_for_status()
         j = r.json()
@@ -206,7 +207,7 @@ def _auth_xbl(ms_access_token: str) -> dict:
         "RelyingParty": "http://auth.xboxlive.com",
         "TokenType": "JWT",
     }
-    with httpx.Client(timeout=_HTTP_TIMEOUT) as c:
+    with get_sync_client() as c:
         r = c.post(XBL_AUTH, json=body, headers={"Accept": "application/json"})
         if r.status_code == 400:
             # 极少数情况要去掉 d= 重试
@@ -224,7 +225,7 @@ def _auth_xsts(xbl_token: str) -> dict:
         "RelyingParty": "rp://api.minecraftservices.com/",  # 末尾斜杠必须有
         "TokenType": "JWT",
     }
-    with httpx.Client(timeout=_HTTP_TIMEOUT) as c:
+    with get_sync_client() as c:
         r = c.post(XSTS_AUTH, json=body, headers={"Accept": "application/json"})
         r.raise_for_status()
         j = r.json()
@@ -234,7 +235,7 @@ def _auth_xsts(xbl_token: str) -> dict:
 # ============ 第4步：MC 认证 ============
 def _auth_minecraft(uhs: str, xsts_token: str) -> dict:
     body = {"identityToken": f"XBL3.0 x={uhs};{xsts_token}"}
-    with httpx.Client(timeout=_HTTP_TIMEOUT) as c:
+    with get_sync_client() as c:
         r = c.post(MC_AUTH, json=body)
         r.raise_for_status()
         j = r.json()
@@ -243,7 +244,7 @@ def _auth_minecraft(uhs: str, xsts_token: str) -> dict:
 
 # ============ 第5步：检查游戏所有权 ============
 def _check_entitlements(mc_access_token: str) -> bool:
-    with httpx.Client(timeout=_HTTP_TIMEOUT) as c:
+    with get_sync_client() as c:
         r = c.get(MC_STORE, headers={"Authorization": f"Bearer {mc_access_token}"})
     if r.status_code == 404:
         return False
@@ -255,7 +256,7 @@ def _check_entitlements(mc_access_token: str) -> bool:
 
 # ============ 第6步：取玩家档案 ============
 def _get_profile(mc_access_token: str) -> Optional[dict]:
-    with httpx.Client(timeout=_HTTP_TIMEOUT) as c:
+    with get_sync_client() as c:
         r = c.get(MC_PROFILE, headers={"Authorization": f"Bearer {mc_access_token}"})
     if r.status_code == 404:
         return None

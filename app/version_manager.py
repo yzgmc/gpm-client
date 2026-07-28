@@ -33,6 +33,7 @@ from datetime import datetime
 from typing import Callable, Optional
 
 import httpx
+from app.downloader import get_sync_client
 
 
 # 进度回调签名: (stage, detail, percent)，与 loader_installer / minecraft_installer 一致
@@ -261,7 +262,7 @@ def is_version_ready(game_root_dir: str, version_id: str) -> bool:
 def fetch_mc_version_ids(release_only: bool = True) -> list[str]:
     """从版本清单拉取可用 MC 版本 id 列表（release 优先）。失败返回空列表。"""
     try:
-        with httpx.Client(timeout=_HTTP_TIMEOUT, follow_redirects=True) as c:
+        with get_sync_client() as c:
             r = c.get(_MANIFEST_URL)
             r.raise_for_status()
             data = r.json()

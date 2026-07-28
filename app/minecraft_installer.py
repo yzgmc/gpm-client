@@ -23,6 +23,11 @@ from typing import Callable, Optional
 
 import httpx
 
+# 共享同步 httpx 客户端（来自 downloader）：
+# 所有 httpx 调用都复用同一连接池，避免每个调用方各自 new 一个 client 导致
+# WinError 10048 端口耗尽。这里不另外维护 _http_client。
+from app.downloader import get_sync_client
+
 
 # 进度回调签名: (stage, detail, percent)
 #   stage ∈ {"download", "done", "error"}
@@ -53,43 +58,16 @@ _MAX_WORKERS = 32
 # BMCLAPI 偶发失败时的重试次数（减少回退到慢官方源的概率）
 _MIRROR_RETRIES = 1
 
-# 共享 HTTP 客户端：复用 TCP/TLS 连接，对数千个 assets 小文件避免重复握手，大幅提速
-# httpx.Client 线程安全（通过连接池），可在 ThreadPoolExecutor 中共享
-_HTTP_LIMITS = httpx.Limits(
-    max_connections=_MAX_WORKERS * 2,
-    max_keepalive_connections=_MAX_WORKERS,
-    keepalive_expiry=30.0,
-)
-_http_client: httpx.Client | None = None
-_http_lock = threading.Lock()
-
-
-def _get_http_client() -> httpx.Client:
-    """懒加载共享 HTTP 客户端（带连接池）。"""
-    global _http_client
-    if _http_client is None:
-        with _http_lock:
-            if _http_client is None:
-                _http_client = httpx.Client(
-                    timeout=_TIMEOUT,
-                    follow_redirects=True,
-                    limits=_HTTP_LIMITS,
-                    headers={"User-Agent": "gpm-client/1.0"},
-                )
-    return _http_client
-
 
 def close_http_client() -> None:
-    """关闭共享 HTTP 客户端（进程退出时调用）。"""
-    global _http_client
-    if _http_client is not None:
-        with _http_lock:
-            if _http_client is not None:
-                try:
-                    _http_client.close()
-                except Exception:  # noqa: BLE001
-                    pass
-                _http_client = None
+    """关闭共享 HTTP 客户端（进程退出时调用）。
+
+    这里只是包一层：实际客户端由 downloader.get_sync_client 维护。
+    保留接口以兼容旧调用方。
+    """
+    from app.downloader import close_sync_client
+
+    close_sync_client()
 
 
 def _sha1_file(path: str) -> str:
@@ -150,7 +128,8 @@ def _download_one(
 
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
     tmp = dest + ".part"
-    client = _get_http_client()
+    # 复用进程级共享 client，连接池不重新创建（避免 WinError 10048 端口耗尽）
+    client = get_sync_client()
     last_err: Exception | None = None
 
     for idx, url in enumerate(urls):
@@ -204,7 +183,9 @@ def _get_json(url: str, cancel_event: Optional[threading.Event] = None) -> dict:
     """GET JSON（复用共享 HTTP 客户端）。"""
     if cancel_event is not None and cancel_event.is_set():
         raise RuntimeError("已取消")
-    r = _get_http_client().get(url)
+    # 复用进程级共享 client，连接池不重新创建
+    with get_sync_client() as c:
+        r = c.get(url, timeout=_TIMEOUT)
     r.raise_for_status()
     return r.json()
 

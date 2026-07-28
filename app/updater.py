@@ -6,15 +6,18 @@
    - 所以本模块只负责"检查+下载+派发"，物理替换由独立的 updater_helper 子进程完成。
 2. 版本比较：使用 packaging.version.Version 标准 semver（含预发布标识）。
 3. 安全性：
-   - 仅信任 github.com 的 Release API（公开 API，无需 token）。
-   - 下载的 exe 校验 sha256（从 Release body/digest 解析，或从 asset digest 头）。
+   - **优先**通过服务端 `/api/v1/client-update/latest` 间接拉 GitHub Release（服务端
+     可持有 GitHub token 提升 rate limit、可缓存 5 分钟）。这样国内访问无需
+     直连 api.github.com。
+   - 后端不可用时**回退**到直连 api.github.com，确保任何网络环境都能升级。
+   - 下载的 exe 校验 sha256（从 Release body/digest 解析）。
    - 升级前再次确认用户已保存数据（即将退出应用）。
 4. 异常处理：所有阶段失败抛 RuntimeError，UI 层捕获并友好提示。
 
 升级流程：
   用户点击"检查更新"
     ↓
-  check_for_update() 调 GitHub API
+  check_for_update() 优先调后端 → 失败时回退 GitHub
     ↓ 有新版本？
   ↓
   show_update_dialog() 让用户确认
@@ -40,11 +43,14 @@ from typing import Callable, Optional
 import httpx
 from packaging.version import InvalidVersion, Version
 
-from app.downloader import download_file
+from app.downloader import download_file, get_sync_client
 from app.version import APP_VERSION, GITHUB_OWNER, GITHUB_REPO, UPDATE_ASSET_NAME
 
-# GitHub Releases API（公开，无需 token，60 次/小时/IP 限流足够个人客户端使用）
+# GitHub Releases API（兜底用：服务端不可用时直连）
 _GITHUB_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+_GITHUB_API_BY_TAG = (
+    f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/tags/{{tag}}"
+)
 _RELEASE_PAGE = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases"
 _TIMEOUT = httpx.Timeout(10.0, read=60.0)
 
@@ -108,8 +114,11 @@ def _extract_digest_from_release(release: dict, asset_name: str) -> Optional[str
     return None
 
 
-def check_for_update() -> UpdateInfo:
-    """查询 GitHub Releases API，比较当前版本与最新版本。
+def check_for_update(server_url: str = "") -> UpdateInfo:
+    """查询最新版本（优先走服务端，回退 GitHub API）。
+
+    Args:
+        server_url: 服务端地址（如 http://127.0.0.1:8001）。为空时直接调 GitHub。
 
     返回 UpdateInfo，无论有无更新都返回（调用方通过 has_update 判断）。
 
@@ -121,7 +130,61 @@ def check_for_update() -> UpdateInfo:
     if current_ver is None:
         raise RuntimeError(f"当前版本号无法解析：{APP_VERSION!r}")
 
-    with httpx.Client(timeout=_TIMEOUT, follow_redirects=True) as c:
+    # 1) 优先走服务端 /api/v1/client-update/latest
+    if server_url:
+        try:
+            info = _check_via_backend(server_url, current_ver)
+            if info is not None:
+                return info
+        except Exception as e:  # noqa: BLE001
+            # 后端不可用不立即报错，记录后回退 GitHub
+            import traceback
+
+            print(f"[updater] 后端检查失败，fallback 到 GitHub: {e}")
+
+    # 2) 回退直连 GitHub API
+    return _check_via_github(current_ver)
+
+
+def _check_via_backend(server_url: str, current_ver: Version) -> Optional[UpdateInfo]:
+    """通过服务端 /api/v1/client-update/latest 查询。
+
+    返回 UpdateInfo；后端不可用时返回 None（让调用方 fallback GitHub）。
+    """
+    url = server_url.rstrip("/") + "/api/v1/client-update/latest"
+    params = {"current": str(current_ver)}
+    with get_sync_client() as c:
+        r = c.get(url, params=params, timeout=_TIMEOUT, follow_redirects=True)
+    if r.status_code == 503:
+        # 服务端主动返回"暂不可用"（GitHub API 异常）
+        return None
+    if r.status_code >= 400:
+        raise RuntimeError(f"服务端 {r.status_code}")
+    data = r.json()
+    if not data.get("available", False):
+        # 服务端拉 GitHub 失败时返回 available:false
+        return None
+
+    latest_ver = _parse_version_from_tag(data.get("latest_version") or data.get("current_tag") or "")
+    if latest_ver is None:
+        return None
+
+    return UpdateInfo(
+        current_version=str(current_ver),
+        latest_version=str(latest_ver),
+        has_update=bool(data.get("has_update", False)),
+        release_notes=data.get("release_notes", "") or "",
+        asset_url=data.get("asset_url", "") or "",
+        asset_size=int(data.get("asset_size", 0) or 0),
+        asset_name=data.get("asset_name", "") or UPDATE_ASSET_NAME,
+        html_url=data.get("html_url", _RELEASE_PAGE),
+        digest_sha256=data.get("digest_sha256"),
+    )
+
+
+def _check_via_github(current_ver: Version) -> UpdateInfo:
+    """直连 GitHub API 查询最新 Release。"""
+    with get_sync_client() as c:
         r = c.get(
             _GITHUB_API,
             headers={
