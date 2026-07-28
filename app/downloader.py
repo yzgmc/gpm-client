@@ -61,32 +61,45 @@ _client_loop: Optional[asyncio.AbstractEventLoop] = None
 _shared_sync_client: Optional[httpx.Client] = None
 
 
+def _create_sync_client() -> httpx.Client:
+    """创建一个新的同步 httpx.Client（连接池配置与全局保持一致）。"""
+    return httpx.Client(
+        timeout=_TIMEOUT,
+        follow_redirects=True,
+        limits=httpx.Limits(
+            max_connections=16,
+            max_keepalive_connections=12,
+            keepalive_expiry=30.0,
+        ),
+        headers={"User-Agent": "GPM-Client/1.0"},
+    )
+
+
 def get_sync_client() -> httpx.Client:
     """获取进程级共享同步 httpx.Client。
 
     所有 HTTP 调用方（installer / api / msa / login / updater / version_manager）
     都应通过此函数获取 client，而不是 with httpx.Client(...) 新建。
     这样 keep-alive 连接在多次调用间复用，避免 WinError 10048 端口耗尽。
+
+    ⚠️ 重要：httpx 0.27+ 的 `__exit__` 会**自动 close** client。
+    我们的所有调用方都写 `with get_sync_client() as c: r = c.get(...)`，
+    第一次 `__exit__` 之后 client 就被关闭；第二次 `with` 进入时
+    `__enter__` 会检测到 CLOSED 状态抛 `Cannot reopen a client instance`。
+    所以这里在返回前检查 is_closed，若是则**静默重建**。
     """
     global _shared_sync_client
-    if _shared_sync_client is None:
-        with _client_lock:
-            if _shared_sync_client is None:
-                _shared_sync_client = httpx.Client(
-                    timeout=_TIMEOUT,
-                    follow_redirects=True,
-                    limits=httpx.Limits(
-                        max_connections=16,
-                        max_keepalive_connections=12,
-                        keepalive_expiry=30.0,
-                    ),
-                    headers={"User-Agent": "GPM-Client/1.0"},
-                )
-    return _shared_sync_client
+    # 快路径：已存在且未 close → 直接返回
+    if _shared_sync_client is not None and not _shared_sync_client.is_closed:
+        return _shared_sync_client
+    with _client_lock:
+        if _shared_sync_client is None or _shared_sync_client.is_closed:
+            _shared_sync_client = _create_sync_client()
+        return _shared_sync_client
 
 
 def close_sync_client() -> None:
-    """关闭共享同步 client。"""
+    """关闭共享同步 client（仅用于程序退出时；不要在业务路径里调用）。"""
     global _shared_sync_client
     with _client_lock:
         if _shared_sync_client is not None:
