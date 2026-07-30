@@ -62,14 +62,22 @@ _shared_sync_client: Optional[httpx.Client] = None
 
 
 def _create_sync_client() -> httpx.Client:
-    """创建一个新的同步 httpx.Client（连接池配置与全局保持一致）。"""
+    """创建一个新的同步 httpx.Client（连接池配置与全局保持一致）。
+
+    关键：keep-alive 在国内代理（Clash）下容易撞 SSL EOF：
+    服务端提前关闭连接，新请求复用旧 socket 时收到 EOF
+    ("EOF occurred in violation of protocol (_ssl.c:997)")。
+    关闭 keep-alive 池，每次请求都新建连接；分块下载不依赖
+    keep-alive（每个 Range 请求是独立 stream），实测对速度影响
+    可忽略，但稳定性大幅提升。
+    """
     return httpx.Client(
         timeout=_TIMEOUT,
         follow_redirects=True,
         limits=httpx.Limits(
             max_connections=16,
-            max_keepalive_connections=12,
-            keepalive_expiry=30.0,
+            max_keepalive_connections=0,
+            keepalive_expiry=5.0,
         ),
         headers={"User-Agent": "GPM-Client/1.0"},
     )
