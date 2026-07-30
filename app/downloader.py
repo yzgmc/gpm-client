@@ -166,9 +166,18 @@ def _create_sync_client() -> httpx.Client:
       （httpx 自动协商 h2，失败则降级到 HTTP/1.1）
     - 更大的 socket 接收缓冲（256KB）减少 syscall 次数
     - TCP_NODELAY 关闭 Nagle 算法，让小包立即发送（适合分块下载的 128KB chunk）
+
+    共享 client 永不 close（关键）：
+    httpx 0.27+ 的 `Client.__exit__` 会调 `self.close()`，而我们十几处
+    调用方都写 `with get_sync_client() as c:` —— 一旦某个线程块结束，
+    共享 client 就被 close，其他线程的同一引用立刻失效，触发
+    `Cannot open a client instance more than once`。
+    修复：把 client.close 替换成 no-op（连接池不释放，永远 keep-alive 复用），
+    同时把原始 close 存到 `_gpm_real_close` 字段，供程序退出时 close_sync_client()
+    真正释放资源用。
     """
     proxy = _detect_proxy()
-    return httpx.Client(
+    client = httpx.Client(
         timeout=_TIMEOUT,
         follow_redirects=True,
         proxy=proxy,
@@ -183,20 +192,69 @@ def _create_sync_client() -> httpx.Client:
         # 启动时如果 h2 不存在 httpx 会自动忽略 http2=True
         http2=True,
     )
+    # 把 client 包装成 _SharedClientWrapper 再返回：
+    # httpx 的 __enter__ / __exit__ 是 dunder 方法，Python 调用时走 type 查找
+    # （type(c).__enter__(c)），不查 instance __dict__，所以直接给 instance
+    # monkey-patch c.__enter__ 不会生效。包装类才是正确做法。
+    return _SharedClientWrapper(client)
 
 
-def get_sync_client() -> httpx.Client:
-    """获取进程级共享同步 httpx.Client。
+class _SharedClientWrapper:
+    """httpx.Client 的无状态包装器：所有方法转发到内部 client。
+
+    核心目的：让 `with get_sync_client() as c: c.get(...)` 可以**反复进入退出**
+    而不触发 httpx 的 "Cannot open a client instance more than once" 错误。
+    原版 httpx.Client.__enter__ 会改 _state 从 UNOPENED → OPENED，且
+    __exit__ 会调 close()；我们的共享 client 要保证：
+      - 多次 with 块进入不抛错
+      - 内部 client 永不真正关闭（连接池始终复用，避免 WinError 10048）
+    所以 __enter__/__exit__/close 都被 no-op 化（close 保留原方法在
+    _gpm_real_close 字段，进程退出时由 close_sync_client() 调）。
+    """
+
+    __slots__ = ("_real", "_gpm_real_close")
+
+    def __init__(self, real_client: httpx.Client) -> None:
+        self._real = real_client
+        self._gpm_real_close = real_client.close
+
+    def __enter__(self) -> "_SharedClientWrapper":
+        """no-op：直接返回 wrapper，让 with 块语法上可用，状态机不推进。"""
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:  # noqa: ANN001
+        """no-op：不传播异常到 client，不关闭连接池。"""
+        return None
+
+    def close(self) -> None:
+        """no-op：业务路径里所有 with 块退出时调的是这个，连接池不释放。
+
+        真正释放由 close_sync_client() 在程序退出时调 self._gpm_real_close 完成。
+        """
+        return None
+
+    # 转发所有其他属性访问到内部 client（get/post/head/stream/...）
+    def __getattr__(self, name: str):
+        # __getattr__ 只在正常属性查找失败时调用，避免 __slots__ 内的字段被转发
+        if name in ("_real", "_gpm_real_close"):
+            raise AttributeError(name)
+        return getattr(self._real, name)
+
+
+def get_sync_client() -> _SharedClientWrapper:
+    """获取进程级共享同步 httpx.Client（包装在 _SharedClientWrapper 中）。
 
     所有 HTTP 调用方（installer / api / msa / login / updater / version_manager）
     都应通过此函数获取 client，而不是 with httpx.Client(...) 新建。
     这样 keep-alive 连接在多次调用间复用，避免 WinError 10048 端口耗尽。
 
-    ⚠️ 重要：httpx 0.27+ 的 `__exit__` 会**自动 close** client。
-    我们的所有调用方都写 `with get_sync_client() as c: r = c.get(...)`，
-    第一次 `__exit__` 之后 client 就被关闭；第二次 `with` 进入时
-    `__enter__` 会检测到 CLOSED 状态抛 `Cannot reopen a client instance`。
-    所以这里在返回前检查 is_closed，若是则**静默重建**。
+    共享 client 永不真正关闭（详见 _SharedClientWrapper 说明）：
+    所有 `with get_sync_client() as c:` 块退出时调的是 no-op close，
+    不会破坏其他线程对该 client 的引用。进程退出时 close_sync_client()
+    才会调 _gpm_real_close 真正释放 socket。
+
+    这里仍然保留 is_closed 重建逻辑作为防御性兜底（理论上不应再触发）：
+    万一 client 真的被外部代码 close 掉，下次 get_sync_client() 会重建。
     """
     global _shared_sync_client
     # 快路径：已存在且未 close → 直接返回
@@ -209,12 +267,22 @@ def get_sync_client() -> httpx.Client:
 
 
 def close_sync_client() -> None:
-    """关闭共享同步 client（仅用于程序退出时；不要在业务路径里调用）。"""
+    """关闭共享同步 client（仅用于程序退出时；不要在业务路径里调用）。
+
+    调用 _gpm_real_close 真正释放连接池（绕过 _SharedClientWrapper
+    安装的 no-op close）。
+    """
     global _shared_sync_client
     with _client_lock:
         if _shared_sync_client is not None:
             try:
-                _shared_sync_client.close()
+                # _shared_sync_client 现在是 _SharedClientWrapper
+                # 其 _gpm_real_close 字段指向内部 client 的真实 close
+                real_close = getattr(_shared_sync_client, "_gpm_real_close", None)
+                if real_close is not None:
+                    real_close()
+                else:
+                    _shared_sync_client.close()
             except Exception:
                 pass
             _shared_sync_client = None
