@@ -1180,7 +1180,7 @@ class MainWindow(QMainWindow):
             return
         cache_dir = os.path.join(self.config.install_base_dir, ".cache", "modpacks", mp["id"])
 
-        # 第一级确认
+        # 第一级确认（保留；高破坏性操作仍需一次明确确认）
         if not ask_yes(
             self,
             "确认删除整合包",
@@ -1193,17 +1193,8 @@ class MainWindow(QMainWindow):
         ):
             return
 
-        # 第二级确认（高破坏性操作，要求用户输入确认短语）
-        from PySide6.QtWidgets import QInputDialog
-
-        confirm_text, ok = QInputDialog.getText(
-            self,
-            "二次确认",
-            f"请输入整合包名称「{mp['name']}」以确认删除：",
-        )
-        if not ok or confirm_text.strip() != mp["name"]:
-            show_info(self, "已取消", "名称不匹配，删除操作已取消。")
-            return
+        # 第二级确认（要求用户输入整合包名称）已取消：用户体验优先，
+        # 第一级的"此操作不可撤销"已是足够的安全网。
 
         # 执行删除：按"先删文件再清记录"顺序，失败立即终止
         self.statusBar().showMessage(f"正在删除整合包「{mp['name']}」…")
