@@ -7,6 +7,8 @@
 2. 下载缺失的 mod 文件
    - Modrinth: 直接拉 files[].downloads[0]，按 path 放到 install_dir 对应子目录
    - CurseForge: 通过服务端 API /api/v1/curseforge/resolve 拿到下载 URL，再拉
+   - **fallback**：Modrinth manifest 给出 downloads[1..N] 作为备用 CDN，
+     主 URL 失败时按顺序尝试，0.3s 退避；CF 没有等价列表，重试 3 次主 URL
 3. 释放 overrides/ 目录（CFG / scripts / config / mods 等所有预设资源）
 
 设计要点：
@@ -20,6 +22,7 @@ from __future__ import annotations
 import os
 import shutil
 import threading
+import time
 import zipfile
 from typing import Callable, Optional
 
@@ -37,6 +40,29 @@ import httpx  # 仅用于 httpx.HTTPError 捕获
 # 进度回调签名: (stage, detail, percent)
 #   stage ∈ {"parse", "download", "extract", "done", "error"}
 ProgressCb = Callable[[str, str, int], None]
+
+
+def _build_url_candidates(item: dict) -> list[str]:
+    """构造下载 URL 候选列表：主 URL 优先 + manifest fallback_urls 兜底。
+
+    Modrinth manifest 格式：
+      "downloads": [
+        "https://cdn.modrinth.com/data/.../file.jar",   # 主 CDN（edge 命中）
+        "https://cdn-raw.modrinth.com/data/.../file.jar",  # 备用
+      ]
+    之前我们只用 downloads[0]，遇到主 CDN 限流/挂掉就 fail。
+    现在按顺序尝试所有候选，全失败才计入 warnings。
+    """
+    urls: list[str] = []
+    primary = item.get("url") or ""
+    if primary:
+        urls.append(primary)
+    fallbacks = item.get("fallback_urls") or []
+    if isinstance(fallbacks, list):
+        for u in fallbacks:
+            if u and u not in urls:
+                urls.append(u)
+    return urls
 
 
 # ============ CurseForge 解析器（通过服务端 API）============
@@ -232,10 +258,15 @@ def install_modpack(
 
                 kind: "modrinth" | "curseforge" — 影响目标路径计算。
                 """
-                url = item.get("url") or ""
-                mod_size = int(item.get("size") or 0) or 1024
-                if not url:
+                url_candidates = _build_url_candidates(item)
+                if not url_candidates:
+                    legacy = item.get("url")
+                    if legacy:
+                        url_candidates = [legacy]
+                if not url_candidates:
                     return 0
+                url = url_candidates[0]  # 用于 path 计算（Modrinth 才有 sub-path）
+                mod_size = int(item.get("size") or 0) or 1024
 
                 # 1) 计算目标路径
                 if kind == "curseforge":
@@ -288,30 +319,49 @@ def install_modpack(
                                 pct,
                             )
 
-                # 4) 实际下载
-                try:
-                    download_file(
-                        url,
-                        dest,
-                        expected_hash=item.get("sha1"),
-                        expected_hash_alg="sha1",  # Modrinth/CF 清单约定
-                        cancel_event=cancel_evt,
-                        progress=_per_mod_cb,
-                    )
-                    with cum_done_lock:
-                        cum_done_ref[0] += mod_size
-                    return mod_size
-                except Exception as e:  # noqa: BLE001
-                    # 取消必须 raise（让外层 as_completed 终止）
-                    if "取消" in str(e) or "Cancelled" in str(e):
-                        raise
-                    # 单个 mod 失败不阻断整合包安装
-                    with cum_done_lock:
-                        summary_dict.setdefault("warnings", []).append(
-                            f"下载 {rel} 失败: {e}"
+                # 4) 实际下载：尝试主 URL + 所有 manifest fallback_urls
+                # Modrinth manifest 的 files[].downloads 数组里，index 0 是主 CDN，
+                # index 1+ 是备用（modrinth 实际可能给 cdn / cdn-raw / maven. 二选一）。
+                # CurseForge 的 cf_files 没有等价 fallback，所以 candidates 只有
+                # 服务端 resolve 给的 url，重试靠 download_file 内部的 3 次重试。
+                url_candidates = _build_url_candidates(item)
+                if not url_candidates:
+                    # 兼容旧格式：fallback_urls 不存在或为空时只用一个 url
+                    legacy = item.get("url")
+                    if legacy:
+                        url_candidates = [legacy]
+                last_err: Optional[Exception] = None
+                for attempt_idx, try_url in enumerate(url_candidates, 1):
+                    try:
+                        download_file(
+                            try_url,
+                            dest,
+                            expected_hash=item.get("sha1"),
+                            expected_hash_alg="sha1",  # Modrinth/CF 清单约定
+                            cancel_event=cancel_evt,
+                            progress=_per_mod_cb,
                         )
-                        cum_done_ref[0] += mod_size
-                    return mod_size
+                        with cum_done_lock:
+                            cum_done_ref[0] += mod_size
+                        return mod_size
+                    except Exception as e:  # noqa: BLE001
+                        # 取消必须 raise（让外层 as_completed 终止）
+                        if "取消" in str(e) or "Cancelled" in str(e):
+                            raise
+                        last_err = e
+                        # 还有下一个候选就退避后重试
+                        if attempt_idx < len(url_candidates):
+                            time.sleep(0.3 * attempt_idx)  # 0.3s, 0.6s, 0.9s
+                            continue
+                        # 所有候选失败：记 warning
+                        break
+                # 全部候选失败
+                with cum_done_lock:
+                    summary_dict.setdefault("warnings", []).append(
+                        f"下载 {rel} 失败（尝试 {len(url_candidates)} 个 URL）: {last_err}"
+                    )
+                    cum_done_ref[0] += mod_size
+                return mod_size
 
             downloaded = 0
             if kind == "modrinth" and plan.get("downloads"):
