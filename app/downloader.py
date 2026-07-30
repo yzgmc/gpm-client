@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import os
 import socket
+import ssl
 import threading
 import time
 from typing import Callable, Optional
@@ -41,7 +42,7 @@ _CHUNK_SIZE = 1 << 16                # 64KB 读块
 _PROGRESS_REPORT_BYTES = 1 << 18     # 256KB 触发一次进度回调
 _MIN_MULTITHREAD_SIZE = 1 << 20      # < 1MB 不切片
 _DEFAULT_THREADS = 4                 # 默认并发分块数（从 8 降到 4，端口压力减半）
-_RETRY_ATTEMPTS = 3                  # 失败重试次数
+_RETRY_ATTEMPTS = 5                  # 失败重试次数（从 3 提至 5；总退避 0.6+1.2+2.4+4.8+9.6 ≈ 18s）
 _RETRY_BASE_DELAY = 0.6              # 退避基础秒数
 
 
@@ -276,9 +277,10 @@ async def _download_range(
                         f.write(chunk)
             return os.path.getsize(part_path)
         except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError,
-                httpx.ConnectTimeout, httpx.ReadTimeout, ConnectionError) as e:
+                httpx.ConnectTimeout, httpx.ReadTimeout, ConnectionError,
+                ssl.SSLError) as e:  # ssl.SSLError: EOF occurred in violation of protocol
             last_err = e
-            # 退避：0.6s, 1.2s, 2.4s
+            # 退避：0.6s, 1.2s, 2.4s, 4.8s, 9.6s
             wait = _RETRY_BASE_DELAY * (2 ** attempt)
             if cancel_event is not None and cancel_event.is_set():
                 raise RuntimeError("下载已取消")
@@ -324,7 +326,8 @@ async def _download_single_async(
                             last_report = downloaded
             return hasher.hexdigest()
         except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError,
-                httpx.ConnectTimeout, httpx.ReadTimeout, ConnectionError) as e:
+                httpx.ConnectTimeout, httpx.ReadTimeout, ConnectionError,
+                ssl.SSLError) as e:  # ssl.SSLError: 偶发协议违规 EOF
             last_err = e
             wait = _RETRY_BASE_DELAY * (2 ** attempt)
             if cancel_event is not None and cancel_event.is_set():
