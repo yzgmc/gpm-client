@@ -5,7 +5,7 @@ __pycache__/
 .env
 data/
 !data/.gitkeep
-downloads/             # 运行时下载缓存（mod / 整合包 / java / loader）
+downloads/
 *.log
 smoke_test.py
 test_*.py
