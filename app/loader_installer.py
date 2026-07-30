@@ -106,23 +106,27 @@ def _download_to_cache(
     if progress:
         progress("download", f"正在下载{label}…", 0)
     try:
-        # 复用进程级共享 client，连接池不重新创建（避免 WinError 10048 端口耗尽）
-        with get_sync_client() as client:
-            with client.stream("GET", url, timeout=_HTTP_TIMEOUT, follow_redirects=True) as resp:
-                resp.raise_for_status()
-                total = int(resp.headers.get("content-length", 0) or 0)
-                done = 0
-                last = -1
-                with open(tmp_path, "wb") as f:
-                    for chunk in resp.iter_bytes(chunk_size=1 << 16):
-                        if cancel_event is not None and cancel_event.is_set():
-                            raise RuntimeError("已取消")
-                        f.write(chunk)
-                        done += len(chunk)
-                        pct = int(done * 100 / total) if total else 0
-                        if progress and pct != last:
-                            last = pct
-                            progress("download", f"下载{label}… {pct}%", pct)
+        # 复用进程级共享 client，连接池不重新创建（避免 WinError 10048 端口耗尽）。
+        # 注意：不要用 `with get_sync_client() as client:` —— httpx 0.27+ 的
+        # `__exit__` 会自动 close 单例 client，且**多线程并发进入**同一 client
+        # 会触发 "Cannot open a client instance more than once" 重入保护。
+        # 改为：直接获取 client，永不 close（keep-alive 一直复用）。
+        client = get_sync_client()
+        with client.stream("GET", url, timeout=_HTTP_TIMEOUT, follow_redirects=True) as resp:
+            resp.raise_for_status()
+            total = int(resp.headers.get("content-length", 0) or 0)
+            done = 0
+            last = -1
+            with open(tmp_path, "wb") as f:
+                for chunk in resp.iter_bytes(chunk_size=1 << 16):
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise RuntimeError("已取消")
+                    f.write(chunk)
+                    done += len(chunk)
+                    pct = int(done * 100 / total) if total else 0
+                    if progress and pct != last:
+                        last = pct
+                        progress("download", f"下载{label}… {pct}%", pct)
         os.replace(tmp_path, cache_path)
         if progress:
             progress("download", f"{label}下载完成", 100)
@@ -200,17 +204,19 @@ def _run_java_installer(
 
 
 def _get_json(url: str) -> object:
-    with get_sync_client() as c:
-        r = c.get(url, timeout=_HTTP_TIMEOUT, follow_redirects=True)
-        r.raise_for_status()
-        return r.json()
+    # 不用 with —— 防止 httpx 0.27+ 重入保护 + 保持 keep-alive
+    client = get_sync_client()
+    r = client.get(url, timeout=_HTTP_TIMEOUT, follow_redirects=True)
+    r.raise_for_status()
+    return r.json()
 
 
 def _get_text(url: str) -> str:
-    with get_sync_client() as c:
-        r = c.get(url, timeout=_HTTP_TIMEOUT, follow_redirects=True)
-        r.raise_for_status()
-        return r.text
+    # 不用 with —— 同上
+    client = get_sync_client()
+    r = client.get(url, timeout=_HTTP_TIMEOUT, follow_redirects=True)
+    r.raise_for_status()
+    return r.text
 
 
 # ============================ Fabric ============================
