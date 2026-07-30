@@ -498,7 +498,7 @@ def download_file(
     cancel_event=None,
     threads: int = _DEFAULT_THREADS,
 ) -> str:
-    """同步入口：内部跑 asyncio loop。
+    """同步入口。
 
     Args:
         url: 下载 URL
@@ -522,33 +522,363 @@ def download_file(
     os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
     tmp_path = dest_path + ".part"
 
-    # 优先在已运行的事件循环里跑（PySide QThread 主循环场景），
-    # 否则新开 loop。统一逻辑替换原来嵌套 try/except 的"猜"做法。
+    # 同步路径直接用 httpx sync 客户端（get_sync_client）。
+    # 历史教训：早期这里走 asyncio.run() 包裹到 ThreadPoolExecutor，
+    # 在 Windows ProactorEventLoop 下创建/销毁事件循环时，
+    # _ProactorBasePipeTransport.__del__ 会在 loop.close() 之后被 GC 触发，
+    # 抛 "RuntimeError: Event loop is closed"。**gpm-client 启动日志里
+    # 一直刷这条错误就是这个原因**。改用同步 httpx 后：
+    #   1) 不再创建/销毁 asyncio loop → Proactor bug 消失
+    #   2) 少一层事件循环调度 → 同步路径更快
+    #   3) 同步代码逻辑更直接，断点续传 / Range / 取消都靠 threading 原语
     try:
-        asyncio.get_running_loop()
-        in_loop = True
+        actual_hash = _download_file_sync(
+            url, tmp_path, progress, cancel_event, threads, expected_hash_alg,
+        )
     except RuntimeError:
-        in_loop = False
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"下载失败: {e}") from e
+    return _finalize_download(
+        url, tmp_path, dest_path, actual_hash, expected_hash or "", expected_hash_alg,
+    )
 
-    async def _run() -> str:
-        return await _download_file_async(url, tmp_path, progress, cancel_event, threads, expected_hash_alg)
 
-    if in_loop:
-        from concurrent.futures import ThreadPoolExecutor
+# -----------------------------------------------------------------------------
+# 同步实现：httpx sync + 进程级共享 client（无 asyncio loop）
+# -----------------------------------------------------------------------------
 
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(lambda: asyncio.run(_run()))
-            actual_hash = future.result()
+def _head_info_sync(client: httpx.Client, url: str) -> tuple[int, bool, str, str]:
+    """HEAD 探测（同步版）。失败回退到 GET Range: bytes=0-0。
+
+    返回 (total_bytes, supports_ranges, etag, last_modified)。
+    etag / last_modified 缺失时返回空串。
+    """
+    try:
+        r = client.head(url)
+        if r.status_code < 400:
+            total = int(r.headers.get("content-length", 0) or 0)
+            accept_ranges = (r.headers.get("accept-ranges", "").lower() == "bytes")
+            etag = r.headers.get("etag", "")
+            last_mod = r.headers.get("last-modified", "")
+            return total, accept_ranges, etag, last_mod
+    except (httpx.HTTPError, ConnectionError, OSError):
+        pass
+    # HEAD 失败/被拒：fallback 到 Range 探测
+    try:
+        r = client.get(url, headers={"Range": "bytes=0-0"})
+        total = 0
+        if r.status_code == 206:
+            cr = r.headers.get("content-range", "")
+            if "/" in cr:
+                try:
+                    total = int(cr.split("/")[-1])
+                except ValueError:
+                    total = 0
+        elif r.status_code == 200:
+            total = int(r.headers.get("content-length", 0) or 0)
+        supports = r.status_code == 206
+        etag = r.headers.get("etag", "")
+        last_mod = r.headers.get("last-modified", "")
+        # fallback 用完要确保 response body 被消费掉，否则连接不会释放
+        try:
+            r.read()
+        except Exception:
+            pass
+        return total, supports, etag, last_mod
+    except (httpx.HTTPError, ConnectionError, OSError) as e:
+        raise RuntimeError(f"HEAD 探测失败: {e}") from e
+
+
+def _download_range_sync(
+    client: httpx.Client,
+    url: str,
+    part_path: str,
+    start: int,
+    end: int,
+    cancel_event,
+    start_offset: int = 0,
+) -> int:
+    """同步下载 [start, end] 区间到 part_path。失败时抛异常。"""
+    last_err: Optional[Exception] = None
+    for attempt in range(_RETRY_ATTEMPTS):
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("下载已取消")
+        try:
+            real_start = start + start_offset
+            # **总是**发 Range：start_offset==0 时也可能是 part 3（start > 0），
+            # 不发 Range 会被服务端误解为"全量下载"（返回 200 + 完整文件），
+            # 多线程合并时 part 文件就会超出预期大小。
+            headers = {"Range": f"bytes={real_start}-{end}"}
+            mode = "ab" if start_offset > 0 else "wb"
+            downloaded = 0
+            with client.stream("GET", url, headers=headers) as resp:
+                # 续传时 server 不支持 Range：返回 200 + 全量内容。truncate 后从头下。
+                if start_offset > 0 and resp.status_code == 200:
+                    with open(part_path, "wb"):
+                        pass
+                    start_offset = 0
+                    mode = "wb"
+                    downloaded = 0
+                resp.raise_for_status()
+                with open(part_path, mode) as f:
+                    if start_offset > 0:
+                        f.seek(start_offset)
+                    for chunk in resp.iter_bytes(chunk_size=_CHUNK_SIZE):
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise RuntimeError("下载已取消")
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                return downloaded
+        except Exception as e:  # noqa: BLE001
+            # 取消必须 raise
+            if "取消" in str(e) or "Cancelled" in str(e):
+                raise
+            last_err = e
+            if attempt < _RETRY_ATTEMPTS - 1:
+                wait = _RETRY_BASE_DELAY * (2 ** attempt)
+                time.sleep(wait)
+                continue
+            break
+    raise RuntimeError(f"分块 [{start}-{end}] 下载失败（重试 {_RETRY_ATTEMPTS} 次后）: {last_err}")
+
+
+def _download_file_sync(
+    url: str,
+    tmp_path: str,
+    progress: Optional[ProgressCallback],
+    cancel_event,
+    threads: int,
+    hash_algo: str,
+) -> str:
+    """同步下载主流程。包含断点续传决策（与 _download_file_async 共享 meta 协议）。"""
+    client = get_sync_client()
+    total, supports_ranges, etag, last_modified = _head_info_sync(client, url)
+    use_multithread = supports_ranges and total >= _MIN_MULTITHREAD_SIZE and threads > 1
+
+    # ----- 续传决策（与异步版一致）-----
+    existing_meta = _read_meta(tmp_path)
+    start_offset = 0
+
+    if (
+        existing_meta is not None
+        and existing_meta.get("url") == url
+        and existing_meta.get("total") == total
+    ):
+        old_etag = existing_meta.get("etag", "")
+        if old_etag and etag and old_etag != etag:
+            _cleanup_partial(tmp_path, multithread=use_multithread)
+        else:
+            if not use_multithread:
+                if os.path.isfile(tmp_path):
+                    start_offset = os.path.getsize(tmp_path)
+                    if total > 0 and start_offset >= total:
+                        return _hash_file(tmp_path, hash_algo)
     else:
-        actual_hash = asyncio.run(_run())
+        _cleanup_partial(tmp_path, multithread=use_multithread)
+        start_offset = 0
 
+    _write_meta(tmp_path, {
+        "url": url,
+        "total": total,
+        "etag": etag,
+        "last_modified": last_modified,
+        "hash_alg": hash_algo,
+    })
+
+    if not use_multithread:
+        # 单线程：直接 stream + 同步 Range
+        last_err: Optional[Exception] = None
+        cur_offset = start_offset
+        for attempt in range(_RETRY_ATTEMPTS):
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("下载已取消")
+            try:
+                hasher = hashlib.new(hash_algo)
+                # 续传：用已有内容播种 hasher
+                if cur_offset > 0 and os.path.isfile(tmp_path):
+                    with open(tmp_path, "rb") as f_seed:
+                        for chunk in iter(lambda: f_seed.read(1 << 20), b""):
+                            hasher.update(chunk)
+
+                headers = {"Range": f"bytes={cur_offset}-"} if cur_offset > 0 else {}
+                with client.stream("GET", url, headers=headers) as resp:
+                    if cur_offset > 0 and resp.status_code == 200:
+                        # server 不支持 Range：truncate 重下
+                        with open(tmp_path, "wb"):
+                            pass
+                        hasher = hashlib.new(hash_algo)
+                        cur_offset = 0
+                        downloaded = 0
+                        resp_total = int(resp.headers.get("content-length", 0) or 0)
+                        if progress:
+                            progress(0, resp_total)
+                        with open(tmp_path, "wb") as f:
+                            last_report = 0
+                            for chunk in resp.iter_bytes(chunk_size=_CHUNK_SIZE):
+                                if cancel_event is not None and cancel_event.is_set():
+                                    raise RuntimeError("下载已取消")
+                                f.write(chunk)
+                                hasher.update(chunk)
+                                downloaded += len(chunk)
+                                if progress and (
+                                    downloaded - last_report >= _PROGRESS_REPORT_BYTES
+                                    or downloaded == resp_total
+                                ):
+                                    progress(downloaded, resp_total)
+                                    last_report = downloaded
+                        _clear_meta(tmp_path)
+                        return hasher.hexdigest()
+
+                    resp.raise_for_status()
+                    if resp.status_code == 206 and cur_offset > 0:
+                        cr = resp.headers.get("content-range", "")
+                        resp_total = 0
+                        if "/" in cr:
+                            try:
+                                resp_total = int(cr.split("/")[-1])
+                            except ValueError:
+                                resp_total = 0
+                        if resp_total == 0:
+                            resp_total = cur_offset + int(resp.headers.get("content-length", 0) or 0)
+                    else:
+                        resp_total = int(resp.headers.get("content-length", 0) or 0)
+
+                    downloaded = cur_offset
+                    if progress:
+                        progress(downloaded, resp_total)
+                    mode = "ab" if cur_offset > 0 else "wb"
+                    with open(tmp_path, mode) as f:
+                        if cur_offset > 0:
+                            f.seek(cur_offset)
+                        last_report = downloaded
+                        for chunk in resp.iter_bytes(chunk_size=_CHUNK_SIZE):
+                            if cancel_event is not None and cancel_event.is_set():
+                                raise RuntimeError("下载已取消")
+                            f.write(chunk)
+                            hasher.update(chunk)
+                            downloaded += len(chunk)
+                            if progress and (
+                                downloaded - last_report >= _PROGRESS_REPORT_BYTES
+                                or downloaded == resp_total
+                            ):
+                                progress(downloaded, resp_total)
+                                last_report = downloaded
+                    _clear_meta(tmp_path)
+                    return hasher.hexdigest()
+            except Exception as e:  # noqa: BLE001
+                if "取消" in str(e) or "Cancelled" in str(e):
+                    raise
+                last_err = e
+                if attempt < _RETRY_ATTEMPTS - 1:
+                    wait = _RETRY_BASE_DELAY * (2 ** attempt)
+                    time.sleep(wait)
+                    continue
+                break
+        raise RuntimeError(f"下载失败（重试 {_RETRY_ATTEMPTS} 次后）: {last_err}")
+
+    # ===== 多线程分块下载 =====
+    n = min(threads, max(1, total // _MIN_MULTITHREAD_SIZE))
+    part_size = total // n
+    ranges: list[tuple[int, int]] = []
+    for i in range(n):
+        s = i * part_size
+        e = (total - 1) if i == n - 1 else (s + part_size - 1)
+        ranges.append((s, e))
+
+    part_paths = [f"{tmp_path}.part{i}" for i in range(n)]
+    part_offsets: list[int] = []
+    for i, pp in enumerate(part_paths):
+        if os.path.isfile(pp):
+            sz = os.path.getsize(pp)
+            expected = ranges[i][1] - ranges[i][0] + 1
+            part_offsets.append(min(sz, expected))
+        else:
+            part_offsets.append(0)
+    already_done = sum(part_offsets)
+    if progress:
+        progress(already_done, total)
+
+    # 用 ThreadPoolExecutor 并发分块；client 是 sync 的，多线程共享安全（httpx.Client
+    # 内部锁保证）。下载进度：每个 part 单独报告 base + delta，整体 total 不变。
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # 计算每个 part 的"全局起始字节"作为 progress 偏移
+    part_bases: list[int] = []
+    running = 0
+    for off in part_offsets:
+        part_bases.append(running)
+        running += off  # 已下载 part 的大小累加（多 part 时 parts 是连续的）
+
+    def _cb_factory(idx: int) -> ProgressCallback:
+        last = [part_offsets[idx]]  # 已经下载的字节作为初始 last
+        base = part_bases[idx]
+        def _cb(d: int, t: int) -> None:
+            if progress is None:
+                return
+            delta = d - last[0]
+            last[0] = d
+            cur = sum(part_offsets) + base + delta - part_offsets[idx]
+            # 简化：所有 part 的 base 总和 + 当前 part 的 d
+            progress(base + d, total)
+        return _cb
+
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        futures = []
+        for i in range(n):
+            cb = _cb_factory(i)
+            futures.append(pool.submit(
+                _download_range_sync, client, url, part_paths[i],
+                ranges[i][0], ranges[i][1], cancel_event, part_offsets[i],
+            ))
+        try:
+            for fut in as_completed(futures):
+                fut.result()  # 任何一个失败立即抛
+        except Exception:
+            if cancel_event is not None:
+                cancel_event.set()
+            raise
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("下载已取消")
+
+    # 合并 + 哈希
+    hasher = hashlib.new(hash_algo)
+    with open(tmp_path, "wb") as out:
+        for pp in part_paths:
+            with open(pp, "rb") as pf:
+                while True:
+                    buf = pf.read(1 << 20)
+                    if not buf:
+                        break
+                    out.write(buf)
+                    hasher.update(buf)
+            try:
+                os.remove(pp)
+            except OSError:
+                pass
+    _clear_meta(tmp_path)
+    return hasher.hexdigest()
+
+
+def _finalize_download(
+    url: str,
+    tmp_path: str,
+    dest_path: str,
+    actual_hash: str,
+    expected_hash: str,
+    expected_hash_alg: str,
+) -> str:
+    """下载完成后的统一收尾：hash 校验 + os.replace 原子覆盖 + 失败清理。
+
+    与异步 / 同步路径解耦，避免两边重复校验逻辑。
+    """
     if expected_hash and actual_hash.lower() != expected_hash.lower():
         # hash 校验失败 → 整个 tmp 不可信，必须清掉（含 meta）防止下次误用旧 part 续传
         _cleanup_partial(tmp_path, multithread=False)
         raise ValueError(
             f"{expected_hash_alg.upper()} 校验失败: 期望 {expected_hash} 实际 {actual_hash}"
         )
-
     os.replace(tmp_path, dest_path)
     return dest_path
 

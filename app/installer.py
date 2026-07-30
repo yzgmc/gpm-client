@@ -146,37 +146,85 @@ def _write_manifest(install_dir: str, manifest: dict) -> None:
 
 
 def _manifest_record_completed(install_dir: str, rel_path: str, sha1: str, size: int) -> None:
-    """记一个 mod 已完成。同时从 failed 列表中移除（如果存在）。"""
-    m = _read_manifest(install_dir)
-    m.setdefault("completed", {})
-    m["completed"][rel_path] = {
-        "sha1": sha1,
-        "size": size,
-        "completed_at": _now_iso(),
-    }
-    if m.get("failed"):
-        m["failed"] = [f for f in m["failed"] if f.get("path") != rel_path]
-    _write_manifest(install_dir, m)
+    """记一个 mod 已完成。同时从 failed 列表中移除（如果存在）。
+
+    读-改-写整体加锁，避免多 worker 并发时丢失更新。
+    """
+    with _manifest_lock:
+        m = _read_manifest_unlocked(install_dir)
+        m.setdefault("completed", {})
+        m["completed"][rel_path] = {
+            "sha1": sha1,
+            "size": size,
+            "completed_at": _now_iso(),
+        }
+        if m.get("failed"):
+            m["failed"] = [f for f in m["failed"] if f.get("path") != rel_path]
+        _write_manifest_unlocked(install_dir, m)
 
 
 def _manifest_record_failed(install_dir: str, rel_path: str, error: str) -> None:
     """记一个 mod 失败（不抛错；非取消型失败）。"""
-    m = _read_manifest(install_dir)
-    failed = m.setdefault("failed", [])
-    # 去重：同一 path 已有 → 更新 error + at
-    failed = [f for f in failed if f.get("path") != rel_path]
-    failed.append({"path": rel_path, "error": error[:500], "at": _now_iso()})
-    m["failed"] = failed
-    _write_manifest(install_dir, m)
+    with _manifest_lock:
+        m = _read_manifest_unlocked(install_dir)
+        failed = m.setdefault("failed", [])
+        # 去重：同一 path 已有 → 更新 error + at
+        failed = [f for f in failed if f.get("path") != rel_path]
+        failed.append({"path": rel_path, "error": error[:500], "at": _now_iso()})
+        m["failed"] = failed
+        _write_manifest_unlocked(install_dir, m)
 
 
 def _manifest_set_stage(install_dir: str, stage: str, **extra) -> None:
     """更新 stage 字段。"""
-    m = _read_manifest(install_dir)
-    m["stage"] = stage
-    for k, v in extra.items():
-        m[k] = v
-    _write_manifest(install_dir, m)
+    with _manifest_lock:
+        m = _read_manifest_unlocked(install_dir)
+        m["stage"] = stage
+        for k, v in extra.items():
+            m[k] = v
+        _write_manifest_unlocked(install_dir, m)
+
+
+def _read_manifest_unlocked(install_dir: str) -> dict:
+    """读 sidecar（**不**加锁；调用方需持有 _manifest_lock）。"""
+    p = _manifest_path(install_dir)
+    if not os.path.isfile(p):
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict) or data.get("version") != _MANIFEST_VERSION:
+            return {}
+        return data
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+
+
+def _write_manifest_unlocked(install_dir: str, manifest: dict) -> None:
+    """原子写 sidecar（**不**加锁；调用方需持有 _manifest_lock）。"""
+    p = _manifest_path(install_dir)
+    try:
+        os.makedirs(install_dir, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            prefix=".gpm-install.", suffix=".tmp", dir=install_dir,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, ensure_ascii=False, indent=2)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+            os.replace(tmp, p)
+        except Exception:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError:
+        pass
 
 
 def _build_url_candidates(item: dict) -> list[str]:
@@ -370,35 +418,41 @@ def install_modpack(
     # ---- 读 sidecar：断点续传 ----
     # 如果之前安装成功（stage == "done"），且 zip 文件未变（mtime 匹配），
     # 且 plan 中所有 mod 都在 completed → 直接返回，避免重复下载。
-    existing_manifest = _read_manifest(install_dir)
+    # 读-判断-写全程加锁，与 worker 写 completed 互斥（避免"刚判断完 done
+    # 又被 worker 改 stage"的竞态）。
     try:
         zip_mtime = os.path.getmtime(archive_path)
     except OSError:
         zip_mtime = 0.0
-    same_zip = (
-        existing_manifest.get("modpack_zip") == os.path.abspath(archive_path)
-        and abs(float(existing_manifest.get("modpack_zip_mtime") or 0) - zip_mtime) < 0.5
-    )
-    if not same_zip:
-        # zip 变了 → 清空 completed / failed（用户重新导入）
-        existing_manifest = {
-            "version": _MANIFEST_VERSION,
-            "modpack_zip": os.path.abspath(archive_path),
-            "modpack_zip_mtime": zip_mtime,
-            "modpack_name": meta.get("name", ""),
-            "modpack_version": meta.get("version", ""),
-            "started_at": _now_iso(),
-            "completed": {},
-            "failed": [],
-            "stage": "parse",
-        }
-    # 写一次最新的 sidecar（确保 modpack_zip/mtime 字段更新）
-    existing_manifest.setdefault("version", _MANIFEST_VERSION)
-    existing_manifest["modpack_zip"] = os.path.abspath(archive_path)
-    existing_manifest["modpack_zip_mtime"] = zip_mtime
-    existing_manifest.setdefault("completed", {})
-    existing_manifest.setdefault("failed", [])
-    _write_manifest(install_dir, existing_manifest)
+    abs_zip = os.path.abspath(archive_path)
+    with _manifest_lock:
+        existing_manifest = _read_manifest_unlocked(install_dir)
+        same_zip = (
+            existing_manifest.get("modpack_zip") == abs_zip
+            and abs(float(existing_manifest.get("modpack_zip_mtime") or 0) - zip_mtime) < 0.5
+        )
+        if not same_zip:
+            # zip 变了 → 清空 completed / failed（用户重新导入）
+            existing_manifest = {
+                "version": _MANIFEST_VERSION,
+                "modpack_zip": abs_zip,
+                "modpack_zip_mtime": zip_mtime,
+                "modpack_name": meta.get("name", ""),
+                "modpack_version": meta.get("version", ""),
+                "started_at": _now_iso(),
+                "completed": {},
+                "failed": [],
+                "stage": "parse",
+            }
+        # 写一次最新的 sidecar（确保 modpack_zip/mtime 字段更新）
+        existing_manifest.setdefault("version", _MANIFEST_VERSION)
+        existing_manifest["modpack_zip"] = abs_zip
+        existing_manifest["modpack_zip_mtime"] = zip_mtime
+        existing_manifest.setdefault("completed", {})
+        existing_manifest.setdefault("failed", [])
+        _write_manifest_unlocked(install_dir, existing_manifest)
+    # 锁已释放——下面的 fast return 校验只读，不与 worker 冲突
+    # （worker 在 fast return 之前还没启动）
 
     # ---- 快速返回：上次安装已 done 且所有 mod 仍就位 ----
     # 校验：每个 mod 的 rel_path 都在 completed 且 dest 文件存在 + hash 匹配
