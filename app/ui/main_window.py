@@ -1604,10 +1604,25 @@ class MainWindow(QMainWindow):
                         cancel_event=self._cancel_event,
                     )
                     if summary.get("warnings"):
-                        # 非致命：状态栏提示，但仍然算安装成功
-                        warns = "; ".join(summary["warnings"][:3])
-                        self._sig_status.emit(f"安装完成（{len(summary['warnings'])} 个警告）")
-                        print(f"[installer] 警告: {warns}")
+                        # 非致命：弹窗让用户看到具体哪些 mod 失败、原因。
+                        # 仅 print 到 stdout 用户根本看不到，且 statusBar
+                        # 5000ms 后消失 —— 用户启动游戏时缺 mod 崩溃，误以为
+                        # "Java 错"，实际是 mod 没装上。
+                        warns = summary["warnings"]
+                        shown = warns[:5]
+                        extra = f"\n（还有 {len(warns) - 5} 条警告）" if len(warns) > 5 else ""
+                        body = "\n".join(f"• {w}" for w in shown) + extra
+                        QMessageBox.warning(
+                            self,
+                            "整合包安装完成（含警告）",
+                            f"整合包已安装，但有 {len(warns)} 个文件未能完成：\n\n"
+                            f"{body}\n\n"
+                            f"可尝试重新下载整合包，或手动补装这些 mod。",
+                        )
+                        self._sig_status.emit(
+                            f"安装完成（含 {len(warns)} 条警告，已弹窗）"
+                        )
+                        print(f"[installer] 警告 ({len(warns)}): {warns}")
                 except RuntimeError as e:
                     if self._cancel_event.is_set() or "取消" in str(e):
                         self._sig_close_dialog.emit(1)
