@@ -70,9 +70,33 @@ class DownloadProgressDialog(QDialog):
         # 立即关闭对话框，不等下载线程退出（下载线程会因 cancel_event 尽快终止）
         self.reject()
 
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        """用户点窗口 X 时也触发 cancel 信号 + 拒绝对话框。
+
+        之前没 override 时，点 X 走 Qt 默认 closeEvent → reject()，但不会 emit canceled，
+        工作线程不会感知"对话框已关闭"，仍会继续跑完，过程中 emit 的 _sig_close_dialog
+        在 slot 端 `if not self._download_dialog: return` 是 no-op。**看起来没事，但实际上
+        用户已经在主窗口上做下一步操作了，daemon 线程还在后台跑 httpx + 写文件**，极端
+        情况会撞 Windows 文件锁或目录被改导致 raise，进而在没人接的状态下崩。
+
+        这里 override 后，X 与「取消」按钮走同一条路径：发 canceled 信号 → cancel_event.set
+        → downloader 下个 chunk 检测到取消抛异常 → worker 退出。
+        """
+        if not self._canceled:
+            self._canceled = True
+            self.canceled.emit()
+        super().closeEvent(event)
+
     def update_progress(self, downloaded: int, total: int) -> None:
         if total > 0:
-            pct = int(downloaded * 100 / total)
+            # 关键：每次都要 reset range 到 (0, 100)，避免上次 (0, 0) 残留
+            # 历史 bug：批量下载 mod 时 _batch_download_mods_worker 第一个 mod 开始前
+            # emit(0, 0) 走 busy 模式，后续真实进度 emit(d, t) 进来时只 setValue(pct)，
+            # 不重置 range → bar 永远停留在 busy 模式，用户看不到任何进度条变化
+            # → 误以为卡死 → 手动关主窗口 → 进程退出 → "下几个 mod 就闪退"。
+            if self._bar.maximum() != 100:
+                self._bar.setRange(0, 100)
+            pct = max(0, min(100, int(downloaded * 100 / total)))
             self._bar.setValue(pct)
             self._stat.setText(f"{human_size(downloaded)} / {human_size(total)}")
         else:

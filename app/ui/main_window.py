@@ -1375,6 +1375,11 @@ class MainWindow(QMainWindow):
 
         已安装（hash 匹配）或目标 mods/ 下同名文件已存在则跳过，防止重复。
         单个文件失败时记录错误并继续后续，最后汇总；取消则立即停止。
+
+        进度条：显示**批量整体进度**（累计已下载字节 / 所有 mod 的总字节），
+        而非单个 mod 的进度。原因：用户选 N 个 mod 时想看"整体完成度"，单 mod
+        进度跳变（0→100%→0%）会让用户误以为下载卡住。状态栏显示"X/Y mod" +
+        当前 mod 名 + 当前 mod 自身进度。
         """
         from app.installer import install_mod as _install_mod
 
@@ -1382,11 +1387,21 @@ class MainWindow(QMainWindow):
         done = 0
         errors: list[str] = []
         skipped = 0
+        # 累计字节数：完成 mod 的字节 + 当前正在下的 mod 的字节
+        cum_bytes = 0
+        # 所有 mod 的总字节（用于算整体百分比；0 = 服务端没给 file_size）
+        total_bytes = sum(int(m.get("file_size") or 0) for m in mods)
+        # 已完成 mod 的字节数（用于算整体百分比时扣除）
+        completed_bytes = [0]  # list 作闭包可变引用
+        # 当前 mod 的总字节（每次循环更新；用于在 status 文本里展示"X.X/YY.Y MB"）
+        cur_total_bytes = [0]
         try:
             for idx, mod in enumerate(mods, 1):
                 if self._cancel_event.is_set():
                     raise RuntimeError("已取消")
                 name = mod.get("name", mod["id"])
+                # 预估当前 mod 字节（无 file_size 时用 1MB 占位，避免整体进度永远卡在 99%）
+                cur_total_bytes[0] = int(mod.get("file_size") or 0) or (1 << 20)
                 try:
                     # 二次确认：本地已安装（hash 匹配）则跳过
                     installed = load_installed()
@@ -1394,18 +1409,43 @@ class MainWindow(QMainWindow):
                     if rec and rec.get("hash") == mod.get("file_hash"):
                         skipped += 1
                         done += 1
+                        # 跳过的 mod 也算"已完成的字节"
+                        completed_bytes[0] += cur_total_bytes[0]
+                        cum_bytes = completed_bytes[0]
                         self._sig_status.emit(f"({idx}/{total}) 跳过已安装：{name}")
+                        # 整体进度条刷新
+                        if total_bytes > 0:
+                            self._sig_progress.emit(cum_bytes, total_bytes)
                         continue
-                    self._sig_status.emit(f"({idx}/{total}) 下载：{name}")
-                    self._sig_progress.emit(0, 0)  # busy indicator
+                    self._sig_status.emit(f"({idx}/{total}) 下载：{name}…")
+                    # 关键：每次进入新 mod 前先把 bar 从 busy 模式切回确定模式
+                    # （update_progress 内部会兜底重置，但这里显式发 total>0 更稳）
+                    if total_bytes > 0:
+                        # 整体百分比："已完成 + 当前 mod 0字节" 起步
+                        self._sig_progress.emit(completed_bytes[0], total_bytes)
+                    else:
+                        # 无总字节信息 → 退化为 busy indicator（让用户知道在跑）
+                        self._sig_progress.emit(0, 0)
+
                     url = self.manager.client.download_url("mods", mod["id"])
                     local_dir = os.path.join(self.config.install_base_dir, ".cache", "mods", mod["id"])
                     dest = os.path.join(local_dir, mod["file_name"])
+
+                    def _agg_progress(d: int, t: int) -> None:
+                        """下载器回调：把单 mod 进度叠加到累计字节上，emit 整体进度。"""
+                        if total_bytes > 0:
+                            overall = completed_bytes[0] + d
+                            self._sig_progress.emit(overall, total_bytes)
+                        else:
+                            # 无总字节信息 → 退化为 busy indicator
+                            self._sig_progress.emit(0, 0)
+
                     download_file(
                         url,
                         dest,
                         expected_hash=mod["file_hash"],
-                        progress=lambda d, t: self._sig_progress.emit(d, t),
+                        expected_hash_alg="sha1",  # GPM 同步接口的 mod file_hash 一律 SHA1（modrinth 约定）
+                        progress=_agg_progress,
                         cancel_event=self._cancel_event,
                     )
                     # 安装到所属整合包的 mods/ 目录
@@ -1441,19 +1481,29 @@ class MainWindow(QMainWindow):
                         "name": mod["name"],
                     }
                     save_installed(installed)
+                    # mod 真正完成 → 累加到 completed_bytes
+                    completed_bytes[0] += cur_total_bytes[0]
+                    cum_bytes = completed_bytes[0]
                     done += 1
+                    # 整体进度条推到 100%（这个 mod 的全部字节已计入）
+                    if total_bytes > 0:
+                        self._sig_progress.emit(cum_bytes, total_bytes)
                 except RuntimeError as e:
                     if self._cancel_event.is_set() or "取消" in str(e):
                         raise  # 取消：跳出整个批量流程
                     errors.append(f"{name}: {e}")
+                    # 失败的 mod 不计入 completed_bytes（视觉上保留未完成感）
                 except Exception as e:  # noqa: BLE001
                     errors.append(f"{name}: {type(e).__name__}: {e}")
+                    self._log_worker_exception(f"download mod {name}", e)
             # 完成
             if errors:
                 self._sig_fail.emit("部分模组下载失败", "\n".join(errors))
             msg = f"批量同步完成：共 {total} 个，成功 {done - skipped}，跳过 {skipped}"
             if skipped:
                 msg += "（已安装/已存在）"
+            if errors:
+                msg += f"，失败 {len(errors)}"
             self._sig_statusbar.emit(msg, 6000)
             self._sig_close_dialog.emit(0)
         except RuntimeError as e:
@@ -1464,6 +1514,8 @@ class MainWindow(QMainWindow):
                 self._sig_fail.emit("下载失败", f"{type(e).__name__}: {e}")
                 self._sig_close_dialog.emit(1)
         except Exception as e:  # noqa: BLE001
+            # 兜底：worker 线程任何未捕获异常都写日志（避免 daemon 线程"沉默死亡"）
+            self._log_worker_exception("_batch_download_mods_worker", e)
             self._sig_fail.emit("下载失败", f"{type(e).__name__}: {e}")
             self._sig_close_dialog.emit(1)
 
@@ -1681,6 +1733,41 @@ class MainWindow(QMainWindow):
             self._download_dialog.accept()
         else:
             self._download_dialog.reject()
+
+    def _log_worker_exception(self, context: str, exc: BaseException) -> None:
+        """worker 线程兜底：把未预期异常连同 traceback 写到 data/worker_crash.log。
+
+        为什么需要：daemon 线程崩了主进程不会自动退出（Python 默认行为），
+        但线程内部的异常如果没人接，Qt 端只看到进度条/对话框没反应，用户
+        难以排查。这里写一份 best-effort 日志，下次启动可读出来对照。
+
+        注意：write_text 在 OSError 时会抛，try/except 内部再包一层避免
+        "日志写失败" 把信号路径也炸了。
+        """
+        import datetime
+        import traceback
+        from app.config import DATA_DIR
+
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            log_path = DATA_DIR / "worker_crash.log"
+            ts = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+            tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            line = (
+                f"\n===== {ts} =====\n"
+                f"context: {context}\n"
+                f"exception: {type(exc).__name__}: {exc}\n"
+                f"traceback:\n{tb}\n"
+            )
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception:
+            # 日志写失败不影响主流程；用 stderr 兜底
+            import sys
+            try:
+                print(f"[worker_crash] {context}: {type(exc).__name__}: {exc}", file=sys.stderr)
+            except Exception:
+                pass
 
     # ---------------- Java 运行时自动安装 ----------------
 
