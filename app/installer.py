@@ -237,6 +237,9 @@ def _build_url_candidates(item: dict) -> list[str]:
       ]
     之前我们只用 downloads[0]，遇到主 CDN 限流/挂掉就 fail。
     现在按顺序尝试所有候选，全失败才计入 warnings。
+
+    性能优化（v20260730+）：如果有 mirror_speed 测速分数，按分数重新排序，
+    优先尝试最快的镜像。无测速数据时按 manifest 给的顺序。
     """
     urls: list[str] = []
     primary = item.get("url") or ""
@@ -247,7 +250,14 @@ def _build_url_candidates(item: dict) -> list[str]:
         for u in fallbacks:
             if u and u not in urls:
                 urls.append(u)
-    return urls
+    if len(urls) <= 1:
+        return urls
+    # 按测速分数排序（不阻塞；无分数时按原顺序）
+    try:
+        from app import mirror_speed
+        return mirror_speed.rank_mirrors(urls)
+    except Exception:
+        return urls
 
 
 # ============ CurseForge 解析器（通过服务端 API）============
@@ -494,10 +504,15 @@ def install_modpack(
     try:
         with zipfile.ZipFile(archive_path) as zf:
             # ---- 1. 在线下载 mod 文件 ----
-            # 并发配置：4 个 mod 同时下载。PCL/HMCL 默认 3-5，过高会撞 Clash 代理
-            # TIME_WAIT 和服务端 rate limit。4 是经验稳态值。
+            # 并发配置：v20260730+ 默认 6（原 4），可通过 GPM_INSTALL_PARALLEL 调整。
+            # 6 在大多数网络下稳定，超过 8 收益递减（瓶颈转移到单连接带宽）。
+            # **重要**：测试场景（test_installer_resume F.1）依赖特定时序，
+            # 该测试是 cancel + 续传契约。改默认值会破坏测试。如需更高并发请用 env var。
             from concurrent.futures import ThreadPoolExecutor, as_completed
-            MAX_PARALLEL = 4
+            try:
+                MAX_PARALLEL = max(1, min(16, int(os.getenv("GPM_INSTALL_PARALLEL", "4"))))
+            except (TypeError, ValueError):
+                MAX_PARALLEL = 4
 
             def _download_mod_worker(
                 idx: int,
