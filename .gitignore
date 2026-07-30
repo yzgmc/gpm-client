@@ -7,3 +7,4 @@ data/
 !data/.gitkeep
 *.log
 smoke_test.py
+test_*.py

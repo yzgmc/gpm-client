@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import socket
 import ssl
@@ -224,10 +225,58 @@ async def close_shared_client() -> None:
 
 
 # -----------------------------------------------------------------------------
+# 断点续传元数据（持久化到 .part.meta.json）
+# -----------------------------------------------------------------------------
+# 用户在下载中途取消、进程崩溃或网络抖动后重试时，下次调用 download_file
+# 会读取此文件判断能否从已有 .part 续传，避免重头下载。
+_META_SUFFIX = ".meta.json"
+
+
+def _meta_path(tmp_path: str) -> str:
+    """下载临时文件对应的元数据 sidecar 路径。"""
+    return tmp_path + _META_SUFFIX
+
+
+def _write_meta(tmp_path: str, meta: dict) -> None:
+    """写入元数据。失败不抛（best effort）。"""
+    p = _meta_path(tmp_path)
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def _read_meta(tmp_path: str) -> Optional[dict]:
+    """读取元数据。文件不存在或损坏返回 None。"""
+    p = _meta_path(tmp_path)
+    if not os.path.isfile(p):
+        return None
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def _clear_meta(tmp_path: str) -> None:
+    """删除元数据 sidecar。失败不抛。"""
+    p = _meta_path(tmp_path)
+    try:
+        os.remove(p)
+    except OSError:
+        pass
+
+
+# -----------------------------------------------------------------------------
 # HEAD 探测
 # -----------------------------------------------------------------------------
-async def _head_info(url: str) -> tuple[int, bool]:
-    """HEAD 探测：返回 (total_bytes, supports_ranges)。失败回退到 GET Range: bytes=0-0。"""
+async def _head_info(url: str) -> tuple[int, bool, str, str]:
+    """HEAD 探测：返回 (total_bytes, supports_ranges, etag, last_modified)。
+
+    失败回退到 GET Range: bytes=0-0（部分 server 不支持 HEAD）。
+    etag / last_modified 缺失时返回空串。
+    """
     client = _get_client()
     try:
         r = await client.head(url)
@@ -242,12 +291,12 @@ async def _head_info(url: str) -> tuple[int, bool]:
                         total = int(cr.split("/")[-1])
                     except ValueError:
                         pass
-            return total, supports
+            return total, supports, r.headers.get("etag", ""), r.headers.get("last-modified", "")
         total = int(r.headers.get("content-length", 0) or 0)
         supports = r.headers.get("accept-ranges", "").lower() in ("bytes", "1")
-        return total, supports
+        return total, supports, r.headers.get("etag", ""), r.headers.get("last-modified", "")
     except httpx.HTTPError:
-        return 0, False
+        return 0, False, "", ""
 
 
 # -----------------------------------------------------------------------------
@@ -260,17 +309,47 @@ async def _download_range(
     start: int,
     end: int,
     cancel_event,
+    start_offset: int = 0,
 ) -> int:
-    """下载 [start, end] 区间到 part_path。失败时抛异常。"""
-    headers = {"Range": f"bytes={start}-{end}"}
+    """下载 [start, end] 区间到 part_path。失败时抛异常。
+
+    Args:
+        start: 区间起点（绝对字节偏移）
+        end: 区间终点（含）
+        start_offset: part_path 已有的字节数。> 0 时发送
+            `Range: bytes={start+start_offset}-{end}` 续传。start_offset 必须 <=
+            (end - start + 1)，否则视为已完成直接返回。
+
+    注意：如果 server 对 Range 请求返回 200（不支持 Range），本函数会抛错
+    让外层重新发起整段下载。已下载的部分会保留到下次 `_download_file_async`
+    检测时由 resume 决策清理（HEAD 探测后会重置 start_offset=0）。
+    """
+    expected_size = end - start + 1
+    if start_offset > expected_size:
+        start_offset = expected_size
+    if start_offset == expected_size and os.path.isfile(part_path) \
+            and os.path.getsize(part_path) == expected_size:
+        return expected_size  # 已完成
+
+    headers = {"Range": f"bytes={start + start_offset}-{end}"}
     last_err: Optional[Exception] = None
     for attempt in range(_RETRY_ATTEMPTS):
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("下载已取消")
         try:
             async with client.stream("GET", url, headers=headers) as resp:
+                if resp.status_code == 200 and start_offset > 0:
+                    # server 不支持 Range 但送了全量内容 → 续传路径上没法干净处理，
+                    # 抛错让外层重置 resume 状态后从头再试。
+                    raise RuntimeError(
+                        f"server 不支持 Range (got 200, expected 206) "
+                        f"part=[{start}-{end}] offset={start_offset}"
+                    )
                 resp.raise_for_status()
-                with open(part_path, "wb") as f:
+                mode = "ab" if start_offset > 0 else "wb"
+                with open(part_path, mode) as f:
+                    if start_offset > 0:
+                        f.seek(start_offset)
                     async for chunk in resp.aiter_bytes(chunk_size=_CHUNK_SIZE):
                         if cancel_event is not None and cancel_event.is_set():
                             raise RuntimeError("下载已取消")
@@ -300,20 +379,80 @@ async def _download_single_async(
     progress: Optional[ProgressCallback],
     cancel_event,
     hash_algo: str = "sha256",
+    start_offset: int = 0,
 ) -> str:
-    """单线程顺序下载（不支持 Range 或文件太小时）。"""
+    """单线程顺序下载（不支持 Range 或文件太小时）。
+
+    Args:
+        start_offset: 已经下载的字节数（断点续传时 > 0）。函数会发送
+            `Range: bytes={start_offset}-` 并以 append 模式写入 tmp_path。
+            如果 server 返回 200（不支持 Range），自动 truncate 后从头重下。
+    """
     hasher = hashlib.new(hash_algo)
+    # 续传：用已有文件内容播种 hasher，保证最终 hash 与全量下载一致
+    if start_offset > 0 and os.path.isfile(tmp_path):
+        with open(tmp_path, "rb") as f_seed:
+            for chunk in iter(lambda: f_seed.read(1 << 20), b""):
+                hasher.update(chunk)
+
     last_err: Optional[Exception] = None
+    # 本轮 loop 使用的 start_offset；遇到 200 响应（Range 不支持）时会被重置为 0
+    cur_offset = start_offset
     for attempt in range(_RETRY_ATTEMPTS):
         try:
-            async with client.stream("GET", url) as resp:
+            headers = {"Range": f"bytes={cur_offset}-"} if cur_offset > 0 else {}
+            async with client.stream("GET", url, headers=headers) as resp:
+                # 续传时 server 不支持 Range：返回 200 + 全量内容。
+                # 此时 truncate 文件、清空 hasher、置 0 后重发请求。
+                if cur_offset > 0 and resp.status_code == 200:
+                    with open(tmp_path, "wb"):
+                        pass
+                    hasher = hashlib.new(hash_algo)
+                    cur_offset = 0
+                    # 重新走主流程（不消耗 retry 配额）
+                    downloaded = 0
+                    total = int(resp.headers.get("content-length", 0) or 0)
+                    if progress:
+                        progress(0, total)
+                    with open(tmp_path, "wb") as f:
+                        last_report = 0
+                        async for chunk in resp.aiter_bytes(chunk_size=_CHUNK_SIZE):
+                            if cancel_event is not None and cancel_event.is_set():
+                                raise RuntimeError("下载已取消")
+                            f.write(chunk)
+                            hasher.update(chunk)
+                            downloaded += len(chunk)
+                            if progress and (downloaded - last_report >= _PROGRESS_REPORT_BYTES
+                                              or downloaded == total):
+                                progress(downloaded, total)
+                                last_report = downloaded
+                    return hasher.hexdigest()
+
                 resp.raise_for_status()
-                total = int(resp.headers.get("content-length", 0) or 0)
-                downloaded = 0
+
+                # 计算 total：206 用 Content-Range，200 用 Content-Length
+                if resp.status_code == 206 and cur_offset > 0:
+                    cr = resp.headers.get("content-range", "")
+                    total = 0
+                    if "/" in cr:
+                        try:
+                            total = int(cr.split("/")[-1])
+                        except ValueError:
+                            total = 0
+                    if total == 0:
+                        total = cur_offset + int(resp.headers.get("content-length", 0) or 0)
+                else:
+                    total = int(resp.headers.get("content-length", 0) or 0)
+
+                downloaded = cur_offset
                 if progress:
-                    progress(0, total)
-                with open(tmp_path, "wb") as f:
-                    last_report = 0
+                    progress(downloaded, total)
+                # append 模式 + 显式 seek；wb 模式用 truncate
+                mode = "ab" if cur_offset > 0 else "wb"
+                with open(tmp_path, mode) as f:
+                    if cur_offset > 0:
+                        f.seek(cur_offset)
+                    last_report = downloaded
                     async for chunk in resp.aiter_bytes(chunk_size=_CHUNK_SIZE):
                         if cancel_event is not None and cancel_event.is_set():
                             raise RuntimeError("下载已取消")
@@ -404,11 +543,8 @@ def download_file(
         actual_hash = asyncio.run(_run())
 
     if expected_hash and actual_hash.lower() != expected_hash.lower():
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
+        # hash 校验失败 → 整个 tmp 不可信，必须清掉（含 meta）防止下次误用旧 part 续传
+        _cleanup_partial(tmp_path, multithread=False)
         raise ValueError(
             f"{expected_hash_alg.upper()} 校验失败: 期望 {expected_hash} 实际 {actual_hash}"
         )
@@ -425,13 +561,71 @@ async def _download_file_async(
     threads: int,
     hash_algo: str = "sha256",
 ) -> str:
-    """异步实现。"""
+    """异步实现。包含断点续传决策：
+
+    - 启动时读 .part.meta.json + HEAD 探测，按 URL/ETag/total 决定能否续传
+    - 续传：保留 .part / .partN，发送 Range: bytes=N- 让 server 接续
+    - 不续传：清理所有 part 文件，下载 meta 后从头开始
+    - 成功：清理 meta（调用方 os.replace(tmp_path, dest_path)）
+    - 失败（网络/取消）：保留 .part + meta，下次进入直接续传
+    """
     client = _get_client()
-    total, supports_ranges = await _head_info(url)
+    total, supports_ranges, etag, last_modified = await _head_info(url)
     use_multithread = supports_ranges and total >= _MIN_MULTITHREAD_SIZE and threads > 1
 
+    # ----- 续传决策 -----
+    # 设计：
+    # - meta + URL/total 匹配 → 信任之前的下载状态
+    # - ETag 变化 → server 文件变了，必须重下
+    # - single-thread：partial 就是 tmp_path 本身（dest.part）
+    # - multi-thread：partial 在 dest.part.part0/1/2/...；tmp_path 是不存在的
+    #   （只下载完成后合并才出现）。所以判断"有 partial"不能依赖 tmp_path。
+    existing_meta = _read_meta(tmp_path)
+    start_offset = 0  # single-thread 用的续传偏移
+
+    if (
+        existing_meta is not None
+        and existing_meta.get("url") == url
+        and existing_meta.get("total") == total
+    ):
+        old_etag = existing_meta.get("etag", "")
+        if old_etag and etag and old_etag != etag:
+            # server 端文件变了 → 重头下载
+            _cleanup_partial(tmp_path, multithread=use_multithread)
+        else:
+            if not use_multithread:
+                # single-thread：partial 就是 tmp_path
+                if os.path.isfile(tmp_path):
+                    start_offset = os.path.getsize(tmp_path)
+                    # 已有完整文件 + total 已知 → 直接 hash 返回，避免重复下载
+                    if total > 0 and start_offset >= total:
+                        return _hash_file(tmp_path, hash_algo)
+                # else: 没有 partial 文件（meta 还在但内容丢了）→ 当全新下载
+            # multi-thread：每个 part 自检，start_offset 不在这里设
+    else:
+        # meta 不存在 / URL 或 total 不匹配 → 清理 stale 状态
+        _cleanup_partial(tmp_path, multithread=use_multithread)
+        start_offset = 0
+
+    # 写 meta（开始下载前）—— 中途崩溃/取消也能续传
+    _write_meta(tmp_path, {
+        "url": url,
+        "total": total,
+        "etag": etag,
+        "last_modified": last_modified,
+        "hash_alg": hash_algo,
+    })
+
     if not use_multithread:
-        return await _download_single_async(client, url, tmp_path, progress, cancel_event, hash_algo)
+        try:
+            actual_hash = await _download_single_async(
+                client, url, tmp_path, progress, cancel_event, hash_algo, start_offset,
+            )
+        except Exception:
+            # 保留 .part + meta 以便下次续传
+            raise
+        _clear_meta(tmp_path)
+        return actual_hash
 
     # ===== 多线程分块下载 =====
     n = min(threads, max(1, total // _MIN_MULTITHREAD_SIZE))
@@ -444,12 +638,24 @@ async def _download_file_async(
 
     part_paths = [f"{tmp_path}.part{i}" for i in range(n)]
 
+    # 每个 part 自检已有大小，作为续传起点
+    part_offsets: list[int] = []
+    for i, pp in enumerate(part_paths):
+        if os.path.isfile(pp):
+            sz = os.path.getsize(pp)
+            expected = ranges[i][1] - ranges[i][0] + 1
+            part_offsets.append(min(sz, expected))
+        else:
+            part_offsets.append(0)
+    already_done = sum(part_offsets)
     if progress:
-        progress(0, total)
+        progress(already_done, total)
 
-    # 用 asyncio.gather 跑多个分块，共享同一 client → 共享连接池
     tasks = [
-        _download_range(client, url, part_paths[i], ranges[i][0], ranges[i][1], cancel_event)
+        _download_range(
+            client, url, part_paths[i], ranges[i][0], ranges[i][1],
+            cancel_event, part_offsets[i],
+        )
         for i in range(n)
     ]
     try:
@@ -457,11 +663,10 @@ async def _download_file_async(
     except Exception:
         if cancel_event is not None:
             cancel_event.set()
-        _cleanup(tmp_path, multithread=True)
+        # 保留 part 文件以便下次续传
         raise
 
     if cancel_event is not None and cancel_event.is_set():
-        _cleanup(tmp_path, multithread=True)
         raise RuntimeError("下载已取消")
 
     # 合并 + 哈希
@@ -479,13 +684,19 @@ async def _download_file_async(
                 os.remove(pp)
             except OSError:
                 pass
+    _clear_meta(tmp_path)
     return hasher.hexdigest()
 
 
 # -----------------------------------------------------------------------------
 # 清理
 # -----------------------------------------------------------------------------
-def _cleanup(tmp_path: str, multithread: bool) -> None:
+def _cleanup_partial(tmp_path: str, multithread: bool) -> None:
+    """清理 .part 文件 + （multi 模式）所有 .partN + meta。
+
+    用于"重置状态"场景，例如 ETag 变化、meta 不匹配、hash 校验失败。
+    失败不抛。
+    """
     if os.path.exists(tmp_path):
         try:
             os.remove(tmp_path)
@@ -503,3 +714,4 @@ def _cleanup(tmp_path: str, multithread: bool) -> None:
                 i += 1
             else:
                 break
+    _clear_meta(tmp_path)
