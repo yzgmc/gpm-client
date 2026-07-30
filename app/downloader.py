@@ -61,6 +61,57 @@ _client_loop: Optional[asyncio.AbstractEventLoop] = None
 _shared_sync_client: Optional[httpx.Client] = None
 
 
+# -----------------------------------------------------------------------------
+# 代理自动探测：GFW 下必须走 Clash / V2Ray 才能访问 mojang/modrinth。
+# Clash 默认端口 7890；V2RayN 10809；SS 1080。WinHTTP system proxy
+# **不会**反映到 env var，httpx 的 trust_env=True 读不到，所以必须显式探测。
+# -----------------------------------------------------------------------------
+_PROXY_CANDIDATES = (
+    "http://127.0.0.1:7890",   # Clash (Windows / macOS 默认)
+    "http://127.0.0.1:7897",   # Clash for Windows 备用
+    "http://127.0.0.1:10809",  # V2RayN
+    "http://127.0.0.1:1080",   # SS / SSR / 其他
+)
+_proxy_url: Optional[str] = None
+_proxy_lock = threading.Lock()
+
+
+def _probe_port(host: str, port: int, timeout: float = 0.2) -> bool:
+    """TCP 端口探测（不发数据）。UP=True，DOWN/timeout=False。"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((host, port))
+        s.close()
+        return True
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        return False
+
+
+def _detect_proxy() -> Optional[str]:
+    """启动时探测本机是否运行 Clash / V2Ray。
+
+    返回 proxy URL（如 'http://127.0.0.1:7890'）或 None。
+    结果在进程内缓存，避免每次请求都重探测。
+    """
+    global _proxy_url
+    with _proxy_lock:
+        if _proxy_url is not None:
+            return _proxy_url or None
+        for url in _PROXY_CANDIDATES:
+            # 解析 url 拿 host:port
+            try:
+                from urllib.parse import urlparse
+                p = urlparse(url)
+                if p.hostname and p.port and _probe_port(p.hostname, p.port):
+                    _proxy_url = url
+                    return _proxy_url
+            except (ValueError, OSError):
+                continue
+        _proxy_url = ""  # 用空字符串标记"探测过且没找到"，下次不重探测
+        return None
+
+
 def _create_sync_client() -> httpx.Client:
     """创建一个新的同步 httpx.Client（连接池配置与全局保持一致）。
 
@@ -70,10 +121,19 @@ def _create_sync_client() -> httpx.Client:
     关闭 keep-alive 池，每次请求都新建连接；分块下载不依赖
     keep-alive（每个 Range 请求是独立 stream），实测对速度影响
     可忽略，但稳定性大幅提升。
+
+    同时：自动探测本机 Clash/V2Ray 端口。GFW 下不走代理直接连
+    mojang / modrinth / github 会被 RST，导致 SSL EOF（与 keep-alive
+    无关的另一成因）。探测到代理则显式设置 proxy=None 走代理；
+    探测不到时 trust_env=True 退回到读 env HTTPS_PROXY（git push
+    等 shell 流程会用这种方式注入）。
     """
+    proxy = _detect_proxy()
     return httpx.Client(
         timeout=_TIMEOUT,
         follow_redirects=True,
+        proxy=proxy,
+        trust_env=proxy is None,
         limits=httpx.Limits(
             max_connections=16,
             max_keepalive_connections=0,
