@@ -207,101 +207,160 @@ def install_modpack(
     try:
         with zipfile.ZipFile(archive_path) as zf:
             # ---- 1. 在线下载 mod 文件 ----
+            # 并发配置：4 个 mod 同时下载。PCL/HMCL 默认 3-5，过高会撞 Clash 代理
+            # TIME_WAIT 和服务端 rate limit。4 是经验稳态值。
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            MAX_PARALLEL = 4
+
+            def _download_mod_worker(
+                idx: int,
+                item: dict,
+                total: int,
+                total_bytes: int,
+                install_dir: str,
+                cum_done_lock: threading.Lock,
+                cum_done_ref: list,
+                progress_cb,
+                cancel_evt,
+                summary_dict: dict,
+                kind: str,
+            ) -> int:
+                """下载单个 mod，**不**抛非取消异常。返回累计字节增量。
+
+                cum_done_ref 是单元素 list（可变引用）—— 闭包内多个 worker
+                通过锁共享同一计数器，下载完一个 mod 时累加。
+
+                kind: "modrinth" | "curseforge" — 影响目标路径计算。
+                """
+                url = item.get("url") or ""
+                mod_size = int(item.get("size") or 0) or 1024
+                if not url:
+                    return 0
+
+                # 1) 计算目标路径
+                if kind == "curseforge":
+                    file_name = (
+                        item.get("fileName")
+                        or f"{item.get('projectID')}-{item.get('fileID')}.jar"
+                    )
+                    rel = file_name
+                else:
+                    rel = item.get("path", "").lstrip("/").replace("/", os.sep)
+                if not rel:
+                    return 0
+                try:
+                    if kind == "curseforge":
+                        dest = _safe_path_within(
+                            install_dir, os.path.join("mods", rel)
+                        )
+                    else:
+                        dest = _safe_path_within(install_dir, rel)
+                except ValueError as e:
+                    with cum_done_lock:
+                        summary_dict.setdefault("warnings", []).append(
+                            f"跳过非法路径 {rel}: {e}"
+                        )
+                    return mod_size  # 占位累加
+
+                os.makedirs(os.path.dirname(dest) or install_dir, exist_ok=True)
+
+                # 2) 命中缓存
+                if os.path.isfile(dest) and os.path.getsize(dest) > 0:
+                    with cum_done_lock:
+                        cum_done_ref[0] += mod_size
+                    return mod_size
+
+                # 3) 单 mod 进度回调：包装成全局累计字节
+                last_pct = [-1]
+
+                def _per_mod_cb(d: int, t: int) -> None:
+                    with cum_done_lock:
+                        overall = cum_done_ref[0] + d
+                    pct = 5 + int(overall * 60 / total_bytes)
+                    pct = min(65, max(pct, 5 + int((idx - 1) * 60 / total)))
+                    if pct != last_pct[0]:
+                        last_pct[0] = pct
+                        if progress_cb:
+                            mod_pct = int(d * 100 / max(1, t))
+                            progress_cb(
+                                "download",
+                                f"下载 mod {idx}/{total}（{mod_pct}%）",
+                                pct,
+                            )
+
+                # 4) 实际下载
+                try:
+                    download_file(
+                        url,
+                        dest,
+                        expected_hash=item.get("sha1"),
+                        expected_hash_alg="sha1",  # Modrinth/CF 清单约定
+                        cancel_event=cancel_evt,
+                        progress=_per_mod_cb,
+                    )
+                    with cum_done_lock:
+                        cum_done_ref[0] += mod_size
+                    return mod_size
+                except Exception as e:  # noqa: BLE001
+                    # 取消必须 raise（让外层 as_completed 终止）
+                    if "取消" in str(e) or "Cancelled" in str(e):
+                        raise
+                    # 单个 mod 失败不阻断整合包安装
+                    with cum_done_lock:
+                        summary_dict.setdefault("warnings", []).append(
+                            f"下载 {rel} 失败: {e}"
+                        )
+                        cum_done_ref[0] += mod_size
+                    return mod_size
+
             downloaded = 0
             if kind == "modrinth" and plan.get("downloads"):
                 downloads = plan["downloads"]
                 total_n = len(downloads)
-                # 预估总字节（Modrinth 提供 fileSize，否则按文件名长度占位）
                 total_bytes = sum(
                     int(d.get("size") or 0) or 1024 for d in downloads
                 ) or 1
-                # 累计已下载字节（mod 完成时累加），用于把单文件 (d, t) 映射为
-                # 全局 (cum_done + d) / total_bytes → 5-65% 进度
                 cum_done_lock = threading.Lock()
-                cum_done = 0
+                cum_done_ref = [0]  # 闭包共享的可变引用
 
                 summary["total_mods"] = total_n
                 if progress:
                     progress("download", f"开始下载 {total_n} 个 mod（{total_bytes // 1024} KB）…", 5)
-                for i, item in enumerate(downloads, 1):
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise RuntimeError("已取消")
-                    url = item.get("url") or ""
-                    if not url:
-                        continue
-                    rel = item.get("path", "").lstrip("/").replace("/", os.sep)
-                    if not rel:
-                        continue
-                    # zip slip 防御：即使 manifest 里写了 ../ 也只写到 install_dir 下
-                    try:
-                        dest = _safe_path_within(install_dir, rel)
-                    except ValueError as e:
-                        summary.setdefault("warnings", []).append(f"跳过非法路径 {rel}: {e}")
-                        continue
-                    os.makedirs(os.path.dirname(dest) or install_dir, exist_ok=True)
-                    # 跳过已存在（用 size 粗略判定，避免重下）
-                    if os.path.isfile(dest) and os.path.getsize(dest) > 0:
-                        pct = 5 + int((cum_done + int(item.get("size") or 0)) * 60 / total_bytes)
-                        if progress:
-                            progress(
-                                "download",
-                                f"已存在 mod {i}/{total_n}（{os.path.basename(rel)}），跳过",
-                                min(pct, 65),
-                            )
-                        with cum_done_lock:
-                            cum_done += int(item.get("size") or 0) or 1024
-                        continue
-                    # 当前 mod 的预估大小（用于实时进度权重）
-                    mod_size = int(item.get("size") or 0) or 1024
 
-                    def _make_per_mod_progress(idx: int, total: int, mod_sz: int):
-                        # 闭包：捕获 cum_done_lock + cum_done 在调用时的引用
-                        last_reported_pct = [-1]
-
-                        def _cb(d: int, t: int, _idx=idx, _total=total, _msz=mod_sz,
-                                _last=last_reported_pct):
-                            with cum_done_lock:
-                                overall = cum_done + d
-                            pct = 5 + int(overall * 60 / total_bytes)
-                            pct = min(65, max(pct, 5 + int((_idx - 1) * 60 / _total)))
-                            if pct != _last[0]:
-                                _last[0] = pct
-                                if progress:
-                                    mod_pct = int(d * 100 / max(1, t))
-                                    progress(
-                                        "download",
-                                        f"下载 mod {_idx}/{_total}（{mod_pct}%）",
-                                        pct,
-                                    )
-
-                        return _cb
-
-                    try:
-                        download_file(
-                            url,
-                            dest,
-                            expected_hash=item.get("sha1"),
-                            expected_hash_alg="sha1",  # Modrinth 清单约定
-                            cancel_event=cancel_event,
-                            progress=_make_per_mod_progress(i, total_n, mod_size),
-                        )
-                        downloaded += 1
-                        with cum_done_lock:
-                            cum_done += mod_size
-                    except Exception as e:  # noqa: BLE001
-                        # 单个 mod 失败不阻断整合包安装
-                        if "取消" in str(e) or "Cancelled" in str(e):
-                            raise
-                        summary.setdefault("warnings", []).append(
-                            f"下载 {rel} 失败: {e}"
-                        )
-                        # 失败也按预估字节推进进度，避免卡住
-                        with cum_done_lock:
-                            cum_done += mod_size
-                    # 当前 mod 完成后给个稳定 pct
-                    pct = 5 + int(cum_done * 60 / total_bytes)
-                    if progress:
-                        progress("download", f"下载 mod {i}/{total_n}", min(pct, 65))
+                # 并发下推 4 个 worker。
+                # - 闭包 + lock 保证 cum_done_ref[0] 安全累加
+                # - as_completed 顺序完成，先完先记 cum_done
+                # - cancel_event.set() 时所有 worker 内 download_file 在下个分块
+                #   检测到取消抛异常，外层捕获后 cancel 其他 future
+                with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as ex:
+                    futures = {
+                        ex.submit(
+                            _download_mod_worker,
+                            i, item, total_n, total_bytes, install_dir,
+                            cum_done_lock, cum_done_ref, progress, cancel_event,
+                            summary, "modrinth",
+                        ): i
+                        for i, item in enumerate(downloads, 1)
+                        if item.get("url")
+                    }
+                    for fut in as_completed(futures):
+                        if cancel_event is not None and cancel_event.is_set():
+                            # 取消其余 worker
+                            for f in futures:
+                                f.cancel()
+                            raise RuntimeError("已取消")
+                        try:
+                            fut.result()  # 取消时此处会抛 RuntimeError
+                            downloaded += 1
+                        except RuntimeError as e:
+                            if "取消" in str(e) or "Cancelled" in str(e):
+                                for f in futures:
+                                    f.cancel()
+                                raise
+                            # 其它异常（已记 warnings）忽略
+                pct = 5 + int(cum_done_ref[0] * 60 / total_bytes)
+                if progress:
+                    progress("download", f"下载 mod 完成（{downloaded}/{total_n}）", min(pct, 65))
 
             elif kind == "curseforge" and plan.get("cf_files"):
                 cf_files = plan["cf_files"]
@@ -320,83 +379,34 @@ def install_modpack(
                     int(r.get("size") or 0) or 1024 for r in resolved
                 ) or 1
                 cum_done_lock = threading.Lock()
-                cum_done = 0
-                for i, item in enumerate(resolved, 1):
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise RuntimeError("已取消")
-                    url = item.get("url") or ""
-                    file_name = item.get("fileName") or f"{item.get('projectID')}-{item.get('fileID')}.jar"
-                    mod_size = int(item.get("size") or 0) or 1024
-                    if not url:
-                        summary.setdefault("warnings", []).append(
-                            f"CF #{item.get('projectID')}/{item.get('fileID')} 无下载 URL"
-                        )
-                        with cum_done_lock:
-                            cum_done += mod_size
-                        continue
-                    # CurseForge 整合包的 mod 全部进 mods/（不含 sub-path）
-                    try:
-                        dest = _safe_path_within(install_dir, os.path.join("mods", file_name))
-                    except ValueError as e:
-                        summary.setdefault("warnings", []).append(
-                            f"CF 跳过非法路径 {file_name}: {e}"
-                        )
-                        with cum_done_lock:
-                            cum_done += mod_size
-                        continue
-                    os.makedirs(os.path.dirname(dest) or install_dir, exist_ok=True)
-                    if os.path.isfile(dest) and os.path.getsize(dest) > 0:
-                        if progress:
-                            pct = 5 + int(cum_done * 60 / total_bytes)
-                            progress("download", f"已存在 mod {i}/{total_n}", min(pct, 65))
-                        with cum_done_lock:
-                            cum_done += mod_size
-                        continue
-
-                    def _make_cf_progress(idx: int, total: int, msz: int):
-                        last_reported_pct = [-1]
-
-                        def _cb(d: int, t: int, _idx=idx, _total=total, _msz=msz,
-                                _last=last_reported_pct):
-                            with cum_done_lock:
-                                overall = cum_done + d
-                            pct = 5 + int(overall * 60 / total_bytes)
-                            pct = min(65, max(pct, 5 + int((_idx - 1) * 60 / _total)))
-                            if pct != _last[0]:
-                                _last[0] = pct
-                                if progress:
-                                    mod_pct = int(d * 100 / max(1, t))
-                                    progress(
-                                        "download",
-                                        f"下载 mod {_idx}/{_total}（{mod_pct}%）",
-                                        pct,
-                                    )
-
-                        return _cb
-
-                    try:
-                        download_file(
-                            url,
-                            dest,
-                            expected_hash=item.get("sha1"),
-                            expected_hash_alg="sha1",
-                            cancel_event=cancel_event,
-                            progress=_make_cf_progress(i, total_n, mod_size),
-                        )
-                        downloaded += 1
-                        with cum_done_lock:
-                            cum_done += mod_size
-                    except Exception as e:  # noqa: BLE001
-                        if "取消" in str(e) or "Cancelled" in str(e):
-                            raise
-                        summary.setdefault("warnings", []).append(
-                            f"下载 {file_name} 失败: {e}"
-                        )
-                        with cum_done_lock:
-                            cum_done += mod_size
-                    pct = 5 + int(cum_done * 60 / total_bytes)
-                    if progress:
-                        progress("download", f"下载 mod {i}/{total_n}", min(pct, 65))
+                cum_done_ref = [0]
+                with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as ex:
+                    futures = {
+                        ex.submit(
+                            _download_mod_worker,
+                            i, item, total_n, total_bytes, install_dir,
+                            cum_done_lock, cum_done_ref, progress, cancel_event,
+                            summary, "curseforge",
+                        ): i
+                        for i, item in enumerate(resolved, 1)
+                        if item.get("url")
+                    }
+                    for fut in as_completed(futures):
+                        if cancel_event is not None and cancel_event.is_set():
+                            for f in futures:
+                                f.cancel()
+                            raise RuntimeError("已取消")
+                        try:
+                            fut.result()
+                            downloaded += 1
+                        except RuntimeError as e:
+                            if "取消" in str(e) or "Cancelled" in str(e):
+                                for f in futures:
+                                    f.cancel()
+                                raise
+                pct = 5 + int(cum_done_ref[0] * 60 / total_bytes)
+                if progress:
+                    progress("download", f"下载 mod 完成（{downloaded}/{total_n}）", min(pct, 65))
 
             summary["downloaded_mods"] = downloaded
 
