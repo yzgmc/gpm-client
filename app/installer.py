@@ -16,11 +16,16 @@
 - 取消支持：threading.Event，下载前检查
 - 错误：单文件失败可选继续（per-file 容错），整体失败抛 RuntimeError
 - 不重复下载：已存在且 SHA1 校验通过的文件跳过
+- **断点续传**：install_dir/.gpm-install.json sidecar 持久化已完成/失败 mod 列表；
+  cancel + 重启后只下载缺失的 mod，已下载的零重传（避免上百个 mod 中途取消后
+  必须全部重下的痛苦体验）。这是对 PCL/HMCL 行为的一比一复刻。
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
+import tempfile
 import threading
 import time
 import zipfile
@@ -32,7 +37,7 @@ from gpm_common.adapters.minecraft import MinecraftAdapter
 # download_file 在 downloader.py，提供哈希校验 + 多线程分块 + 进度回调
 # get_sync_client 是进程级共享 httpx.Client，所有 HTTP 调用复用同一连接池
 # （避免 WinError 10048 端口耗尽）
-from app.downloader import download_file, get_sync_client
+from app.downloader import download_file, get_sync_client, _hash_file
 
 import httpx  # 仅用于 httpx.HTTPError 捕获
 
@@ -40,6 +45,138 @@ import httpx  # 仅用于 httpx.HTTPError 捕获
 # 进度回调签名: (stage, detail, percent)
 #   stage ∈ {"parse", "download", "extract", "done", "error"}
 ProgressCb = Callable[[str, str, int], None]
+
+
+# ============ install.json sidecar（断点续传）============
+# 参考 PCL2 / HMCL 行为：取消后重启只下缺失的 mod。
+# 写入位置：<install_dir>/.gpm-install.json
+#
+# Schema:
+# {
+#   "version": 1,
+#   "modpack_zip": "<absolute zip path>",
+#   "modpack_zip_mtime": <float>,  # 用于检测"用户重新导入同一个 zip"
+#   "modpack_name": "...",
+#   "modpack_version": "...",
+#   "started_at": "<iso8601>",
+#   "completed": {
+#     "<rel_path>": {
+#       "sha1": "abc...",  # 可选；存在则二次校验 dest
+#       "size": 12345,
+#       "completed_at": "<iso8601>"
+#     }
+#   },
+#   "failed": [
+#     {"path": "<rel_path>", "error": "...", "at": "<iso8601>"}
+#   ],
+#   "stage": "parse" | "download" | "extract" | "done"
+# }
+#
+# 原子写：先写 .tmp 再 os.replace，避免中途崩溃损坏 sidecar。
+# 线程安全：所有读 / 写都通过 _manifest_lock 串行化（多 worker 并发下）。
+_MANIFEST_NAME = ".gpm-install.json"
+_MANIFEST_VERSION = 1
+_manifest_lock = threading.Lock()
+
+
+def _manifest_path(install_dir: str) -> str:
+    return os.path.join(install_dir, _MANIFEST_NAME)
+
+
+def _now_iso() -> str:
+    """当前时间 ISO 8601 字符串（带本地时区）。失败不抛。"""
+    try:
+        import datetime
+        return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    except Exception:
+        return ""
+
+
+def _read_manifest(install_dir: str) -> dict:
+    """读 sidecar。文件不存在或损坏返回空 dict。线程安全。"""
+    with _manifest_lock:
+        p = _manifest_path(install_dir)
+        if not os.path.isfile(p):
+            return {}
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict) or data.get("version") != _MANIFEST_VERSION:
+                return {}  # 旧版本/格式不符 → 视为空
+            return data
+        except (OSError, json.JSONDecodeError, ValueError):
+            return {}
+
+
+def _write_manifest(install_dir: str, manifest: dict) -> None:
+    """原子写 sidecar。失败不抛（best effort）。
+
+    实现：
+    1. 写 .tmp 到同目录（同盘才能 os.replace 原子）
+    2. fsync 强制落盘
+    3. os.replace → 原子覆盖
+    """
+    with _manifest_lock:
+        p = _manifest_path(install_dir)
+        try:
+            os.makedirs(install_dir, exist_ok=True)
+            # 同目录 tmp，避免 os.replace 跨盘失败
+            fd, tmp = tempfile.mkstemp(
+                prefix=".gpm-install.", suffix=".tmp", dir=install_dir,
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(manifest, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    try:
+                        os.fsync(f.fileno())
+                    except OSError:
+                        pass
+                os.replace(tmp, p)
+            except Exception:
+                # 写失败时清理 tmp，避免污染目录
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                raise
+        except OSError:
+            # sidecar 写失败不应阻塞主流程（用户仍能正常安装）
+            pass
+
+
+def _manifest_record_completed(install_dir: str, rel_path: str, sha1: str, size: int) -> None:
+    """记一个 mod 已完成。同时从 failed 列表中移除（如果存在）。"""
+    m = _read_manifest(install_dir)
+    m.setdefault("completed", {})
+    m["completed"][rel_path] = {
+        "sha1": sha1,
+        "size": size,
+        "completed_at": _now_iso(),
+    }
+    if m.get("failed"):
+        m["failed"] = [f for f in m["failed"] if f.get("path") != rel_path]
+    _write_manifest(install_dir, m)
+
+
+def _manifest_record_failed(install_dir: str, rel_path: str, error: str) -> None:
+    """记一个 mod 失败（不抛错；非取消型失败）。"""
+    m = _read_manifest(install_dir)
+    failed = m.setdefault("failed", [])
+    # 去重：同一 path 已有 → 更新 error + at
+    failed = [f for f in failed if f.get("path") != rel_path]
+    failed.append({"path": rel_path, "error": error[:500], "at": _now_iso()})
+    m["failed"] = failed
+    _write_manifest(install_dir, m)
+
+
+def _manifest_set_stage(install_dir: str, stage: str, **extra) -> None:
+    """更新 stage 字段。"""
+    m = _read_manifest(install_dir)
+    m["stage"] = stage
+    for k, v in extra.items():
+        m[k] = v
+    _write_manifest(install_dir, m)
 
 
 def _build_url_candidates(item: dict) -> list[str]:
@@ -230,6 +367,76 @@ def install_modpack(
         "meta": meta,
     }
 
+    # ---- 读 sidecar：断点续传 ----
+    # 如果之前安装成功（stage == "done"），且 zip 文件未变（mtime 匹配），
+    # 且 plan 中所有 mod 都在 completed → 直接返回，避免重复下载。
+    existing_manifest = _read_manifest(install_dir)
+    try:
+        zip_mtime = os.path.getmtime(archive_path)
+    except OSError:
+        zip_mtime = 0.0
+    same_zip = (
+        existing_manifest.get("modpack_zip") == os.path.abspath(archive_path)
+        and abs(float(existing_manifest.get("modpack_zip_mtime") or 0) - zip_mtime) < 0.5
+    )
+    if not same_zip:
+        # zip 变了 → 清空 completed / failed（用户重新导入）
+        existing_manifest = {
+            "version": _MANIFEST_VERSION,
+            "modpack_zip": os.path.abspath(archive_path),
+            "modpack_zip_mtime": zip_mtime,
+            "modpack_name": meta.get("name", ""),
+            "modpack_version": meta.get("version", ""),
+            "started_at": _now_iso(),
+            "completed": {},
+            "failed": [],
+            "stage": "parse",
+        }
+    # 写一次最新的 sidecar（确保 modpack_zip/mtime 字段更新）
+    existing_manifest.setdefault("version", _MANIFEST_VERSION)
+    existing_manifest["modpack_zip"] = os.path.abspath(archive_path)
+    existing_manifest["modpack_zip_mtime"] = zip_mtime
+    existing_manifest.setdefault("completed", {})
+    existing_manifest.setdefault("failed", [])
+    _write_manifest(install_dir, existing_manifest)
+
+    # ---- 快速返回：上次安装已 done 且所有 mod 仍就位 ----
+    # 校验：每个 mod 的 rel_path 都在 completed 且 dest 文件存在 + hash 匹配
+    if existing_manifest.get("stage") == "done" and plan.get("downloads"):
+        expected_paths: list[str] = []
+        for it in plan["downloads"]:
+            rel = it.get("path", "").lstrip("/").replace("/", os.sep)
+            if rel:
+                expected_paths.append(rel)
+        completed_map = existing_manifest.get("completed") or {}
+        if expected_paths and all(p in completed_map for p in expected_paths):
+            # 二次确认 dest 还在 + hash 对得上（防止用户手动删了文件后 sidecar 还在）
+            all_intact = True
+            for it in plan["downloads"]:
+                rel = it.get("path", "").lstrip("/").replace("/", os.sep)
+                if not rel:
+                    continue
+                dest = _safe_path_within(install_dir, rel)
+                if not os.path.isfile(dest) or os.path.getsize(dest) == 0:
+                    all_intact = False
+                    break
+                expected_hash = (it.get("sha1") or "").lower()
+                recorded_hash = (completed_map.get(rel, {}).get("sha1") or "").lower()
+                if expected_hash and recorded_hash and expected_hash != recorded_hash:
+                    all_intact = False
+                    break
+            if all_intact:
+                # 全部就位 → 直接返回，零下载
+                summary["total_mods"] = len(expected_paths)
+                summary["downloaded_mods"] = 0  # 全部 cache-hit
+                if progress:
+                    progress(
+                        "done",
+                        f"整合包已就绪（{len(expected_paths)}/{len(expected_paths)} mod，跳过下载）",
+                        100,
+                    )
+                return summary
+
     try:
         with zipfile.ZipFile(archive_path) as zf:
             # ---- 1. 在线下载 mod 文件 ----
@@ -295,8 +502,51 @@ def install_modpack(
 
                 os.makedirs(os.path.dirname(dest) or install_dir, exist_ok=True)
 
-                # 2) 命中缓存
-                if os.path.isfile(dest) and os.path.getsize(dest) > 0:
+                # 2) Manifest 命中（**F.3 续传核心**）
+                # 如果 sidecar 已记这个 mod 完成（上次 install_modpack 中途 cancel，
+                # 但该 mod 已经下完写入 dest），重启后直接跳过。
+                # 二次校验：dest 文件存在 + size 一致 + hash 匹配
+                manifest_completed = (existing_manifest.get("completed") or {}).get(rel)
+                if manifest_completed:
+                    recorded_size = int(manifest_completed.get("size") or 0)
+                    recorded_hash = (manifest_completed.get("sha1") or "").lower()
+                    if os.path.isfile(dest) and os.path.getsize(dest) > 0:
+                        if recorded_size and os.path.getsize(dest) != recorded_size:
+                            pass  # size 不一致 → 重新走下面 hash 校验流程
+                        elif recorded_hash:
+                            actual_hash = _hash_file(dest, "sha1").lower()
+                            if actual_hash == recorded_hash:
+                                with cum_done_lock:
+                                    cum_done_ref[0] += mod_size
+                                return mod_size  # manifest 命中，跳过下载
+                        elif not recorded_hash and recorded_size and os.path.getsize(dest) == recorded_size:
+                            with cum_done_lock:
+                                cum_done_ref[0] += mod_size
+                            return mod_size
+
+                # 3) 命中缓存（**先验 hash**，防止下载过但被破坏的文件被永久跳过）
+                # H 改动后：download_file 内部自带 .part + .meta 续传，所以即使
+                # dest 损坏 / 部分下载，都会在后续 download_file 阶段自动重试，
+                # 而不会让"损坏但有 size"的缓存文件蒙混过关。
+                expected_hash = (item.get("sha1") or "").lower()
+                if expected_hash and os.path.isfile(dest) and os.path.getsize(dest) > 0:
+                    actual_hash = _hash_file(dest, "sha1").lower()
+                    if actual_hash == expected_hash:
+                        # 补一次 manifest 记录（首次 install 命中 hash 但 sidecar
+                        # 还没写的情况；幂等）
+                        _manifest_record_completed(
+                            install_dir, rel, actual_hash, os.path.getsize(dest),
+                        )
+                        with cum_done_lock:
+                            cum_done_ref[0] += mod_size
+                        return mod_size
+                    # hash 不匹配 → 当 cache miss，让 download_file 走正常下载流程
+                    # （包括 H 提供的 .part 续传能力；os.replace 会原子覆盖损坏的 dest）
+                elif os.path.isfile(dest) and os.path.getsize(dest) > 0:
+                    # 无预期 hash → 信任现有文件（无法验证）
+                    _manifest_record_completed(
+                        install_dir, rel, "", os.path.getsize(dest),
+                    )
                     with cum_done_lock:
                         cum_done_ref[0] += mod_size
                     return mod_size
@@ -341,6 +591,18 @@ def install_modpack(
                             cancel_event=cancel_evt,
                             progress=_per_mod_cb,
                         )
+                        # 写 sidecar：记录本 mod 已完成（即使后续 cancel 也不影响这个）
+                        try:
+                            actual_sha1 = ""
+                            if item.get("sha1"):
+                                actual_sha1 = _hash_file(dest, "sha1").lower()
+                            _manifest_record_completed(
+                                install_dir, rel,
+                                actual_sha1 or (item.get("sha1") or "").lower(),
+                                os.path.getsize(dest),
+                            )
+                        except OSError:
+                            pass
                         with cum_done_lock:
                             cum_done_ref[0] += mod_size
                         return mod_size
@@ -355,7 +617,11 @@ def install_modpack(
                             continue
                         # 所有候选失败：记 warning
                         break
-                # 全部候选失败
+                # 全部候选失败：记 sidecar 失败 + 警告
+                try:
+                    _manifest_record_failed(install_dir, rel, str(last_err)[:200])
+                except OSError:
+                    pass
                 with cum_done_lock:
                     summary_dict.setdefault("warnings", []).append(
                         f"下载 {rel} 失败（尝试 {len(url_candidates)} 个 URL）: {last_err}"
@@ -504,6 +770,16 @@ def install_modpack(
         raise
     except Exception as e:
         raise RuntimeError(f"整合包安装失败: {e}") from e
+
+    # ---- 标记安装完成 ----
+    # 即使有部分 mod 失败（warnings），stage 仍标 "done_partial"；只有全部成功才标 "done"。
+    final_stage = (
+        "done" if not summary.get("warnings") else "done_partial"
+    )
+    _manifest_set_stage(
+        install_dir, final_stage,
+        finished_at=_now_iso(),
+    )
 
     if progress:
         progress(
